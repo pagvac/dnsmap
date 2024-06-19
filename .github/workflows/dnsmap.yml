@@ -1,0 +1,21 @@
+name: dnsmap
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '45 17 * * 3'
+  workflow_dispatch:
+
+jobs:
+  dnsmap-command:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Run dnsmap
+      run: python dnsmap.py github.com
