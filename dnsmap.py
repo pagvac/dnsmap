@@ -389,7 +389,7 @@ subs_set = {
     "jc",
     "jd",
     "je",
-    "jenkins',
+    "jenkins",
     "jf",
     "jg",
     "jh",
