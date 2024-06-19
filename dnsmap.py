@@ -113,6 +113,7 @@ subs_set = {
     "chimera",
     "chronos", # time server?
     "ci",
+    "cicd",
     "citrix",
     "cj",
     "ck",
@@ -388,6 +389,7 @@ subs_set = {
     "jc",
     "jd",
     "je",
+    "jenkins',
     "jf",
     "jg",
     "jh",
@@ -630,6 +632,7 @@ subs_set = {
     "pj",
     "pk",
     "pl",
+    "platform",
     "pm",
     "pn",
     "po",
