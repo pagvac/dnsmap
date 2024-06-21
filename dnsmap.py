@@ -485,6 +485,7 @@ subs_set = {
     "mail",
     "mailgate",
     "manager",
+    "manual",
     "marketing",
     "mb",
     "mc",
