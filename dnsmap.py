@@ -777,6 +777,7 @@ subs_set = {
     "staging",
     "stats",
     "status",
+    "store",
     "su",
     "sun",
     "support",
