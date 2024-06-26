@@ -121,6 +121,7 @@ subs_set = {
     "classroom",
     "clientes",
     "clients",
+    "cloud",
     "cm",
     "cn",
     "co",
