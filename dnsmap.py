@@ -43,6 +43,7 @@ subs_set = {
     "ap",
     "api",
     "apollo",
+    "app",
     "aq",
     "ar",
     "archivos",
