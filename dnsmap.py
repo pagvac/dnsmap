@@ -155,6 +155,7 @@ subs_set = {
     "demon",
     "demostration",
     "descargas",
+    "dev",
     "develop",
     "developers",
     "development",
