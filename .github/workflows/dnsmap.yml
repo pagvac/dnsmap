@@ -10,7 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'domain name'
+        description: 'your domain name'
+        default: 'github.com'
         type: string
         required: false
   
