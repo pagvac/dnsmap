@@ -8,6 +8,12 @@ on:
   schedule:
     - cron: '45 17 * * 3'
   workflow_dispatch:
+    inputs:
+      domain:
+        description: 'domain name'
+        type: string
+        required: false
+  
 
 jobs:
   dnsmap-command:
