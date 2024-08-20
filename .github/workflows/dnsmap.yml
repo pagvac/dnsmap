@@ -2,7 +2,7 @@ name: dnsmap
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "pagvac-patch-1" ]
   pull_request:
     branches: [ "main" ]
   schedule:
