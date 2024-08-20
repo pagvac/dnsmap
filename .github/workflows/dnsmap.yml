@@ -2,12 +2,19 @@ name: dnsmap
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "pagvac-patch-1" ]
   pull_request:
     branches: [ "main" ]
   schedule:
     - cron: '45 17 * * 3'
   workflow_dispatch:
+    inputs:
+      domain:
+        description: 'your domain name'
+        default: 'github.com'
+        type: string
+        required: false
+  
 
 jobs:
   dnsmap-command:
@@ -17,5 +24,9 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-    - name: Run dnsmap
+    - name: Run dnsmap against github.com
+      if: "${{ github.event.inputs.domain == '' }}"
       run: python dnsmap.py github.com
+    - name: Run dnsmap against user-supplied domain name  
+      if: "${{ github.event.inputs.domain }}"
+      run: python dnsmap.py ${{ github.event.inputs.domain }}
