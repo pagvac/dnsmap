@@ -23,5 +23,9 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-    - name: Run dnsmap
+    - name: Run dnsmap against github.com
+      if: "${{ github.event.inputs.domain == '' }}"
       run: python dnsmap.py github.com
+    - name: Run dnsmap against user-supplied domain name  
+      if: "${{ github.event.inputs.domain }}"
+      run: python dnsmap.py ${{ github.event.inputs.domain }}
