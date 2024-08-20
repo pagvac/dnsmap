@@ -3,8 +3,12 @@ name: dnsmap
 on:
   push:
     branches: [ "main", "pagvac-patch-1" ]
+    paths-ignore:
+      - '**/README.md'
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - '**/README.md'
   schedule:
     - cron: '45 17 * * 3'
   workflow_dispatch:
@@ -15,7 +19,6 @@ on:
         type: string
         required: false
   
-
 jobs:
   dnsmap-command:
     permissions:
