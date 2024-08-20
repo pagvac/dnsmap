@@ -4,7 +4,7 @@ This is the project page of the new version of dnsmap which has been ported from
 
 See an example command below. Yup, it's that simple! 😜
 ```
-$ python dnsmap.py github.com
+$ python3 dnsmap.py github.com
 support.github.com
 status.github.com
 fr.github.com
