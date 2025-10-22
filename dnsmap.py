@@ -1,3 +1,5 @@
+import string
+import socket
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -21,6 +23,14 @@ import sys
 import shutil
 import math
 import time
+
+# Try to use uvloop for faster event loop if available
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
+
 from collections import deque, defaultdict
 from time import monotonic
 from typing import Set, List, Dict, Tuple, Optional
@@ -51,22 +61,23 @@ DEFAULT_NAMESERVERS = [
     "208.67.222.222", "208.67.220.220",
     "216.146.35.35", "216.146.36.36",
 ]
+
 random.shuffle(DEFAULT_NAMESERVERS)
 
 # ---------- Auto-tuning limits ----------
 CONC_MIN = 64
-CONC_MAX = 256
+CONC_MAX = 1024
 TARGET_P90_MS = 400.0
-TIMEOUT_MIN = 1.0
-TIMEOUT_MAX = 5.0
-ADJUST_PERIOD = 5.0
+TIMEOUT_MIN = 0.5
+TIMEOUT_MAX = 3.0
+ADJUST_PERIOD = 2.0
 METRICS_WINDOW = 1000
 RAMP_MIN_SAMPLES = 200
 # ---------------------------------------
 
 # ---------- Initial seeds ----------
-INITIAL_CONCURRENCY = 100
-INITIAL_TIMEOUT = 2.0
+INITIAL_CONCURRENCY = 256
+INITIAL_TIMEOUT = 1.0
 # -----------------------------------
 
 # ---------- Full subdomain set (wrapped to ≤80 chars/line) ----------
@@ -8231,6 +8242,7 @@ def make_resolver(ns: str, timeout: float) -> aresolver.Resolver:
     r.nameservers = [ns]
     r.timeout = timeout
     r.lifetime = timeout
+    r.retry_servfail = False
     r.retry_servfail = True
     return r
 
@@ -8339,7 +8351,7 @@ async def timed_resolve(fq: str, resolver: aresolver.Resolver, qtype: str, lifet
     try:
         ans = await asyncio.wait_for(
             resolver.resolve(fq, qtype, lifetime=lifetime),
-            timeout=lifetime + 0.5
+            timeout=lifetime + 0.2
         )
         lat = (time.perf_counter() - t0) * 1000
         await telemetry.record(lat, 'success')
@@ -8447,7 +8459,7 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                 limiter.release()
             if addrs and (not wildcard_ips or not all(a in wildcard_ips for a in addrs)):
                 progress['found'] += 1
-                print(name, flush=True)
+                print(name)
             progress['processed'] += 1
         except Exception as e:
             sys.stderr.write(f"[warn] worker error: {e}\n"); sys.stderr.flush()
@@ -8584,30 +8596,86 @@ def _format_time(seconds):
 
 def render_progress_stderr(done, total, start_time, found):
     width = max(40, _term_width())
-    bar_space = max(10, width - 40)
-    pct = 0 if total == 0 else min(100, int(done * 100 / total))
-    filled = 0 if total == 0 else int(bar_space * (done / total))
-    bar = "#" * filled + "-" * (bar_space - filled)
     elapsed = time.perf_counter() - start_time
     rate = done / elapsed if elapsed > 0 else 0.0
     remaining = max(0.0, (total - done) / rate) if rate > 0 else 0.0
+    pct = 0 if total == 0 else min(100, int(done * 100 / total))
+
+    # Build prototype to measure trailing width correctly
+    proto = f" {pct:3d}% [] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
+    bar_space = max(10, width - (len(proto) - 2))
+
+    filled = 0 if total == 0 else int(bar_space * (done / total))
+    bar = "#" * filled + "-" * (bar_space - filled)
+
     msg = f" {pct:3d}% [{bar}] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
     try:
-        sys.stderr.write("\r" + msg[:width])
+        sys.stderr.write("\r" + msg.ljust(width)[:width])
         sys.stderr.flush()
     except Exception:
         pass
 # ------------------------------------
+
+
+
+# --- Wildcard pre-check (fast, low-code) ------------------------------------
+def _rand_label(n: int = 16) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return ''.join(random.choice(alphabet) for _ in range(n))
+
+async def _get_ips_via_system(name: str) -> set:
+    # Use system resolver (async) to avoid coupling with internal resolver classes.
+    # AF_UNSPEC gets both A and AAAA; we only need the addresses.
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(name, 80, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+        return {ai[4][0] for ai in infos if ai and ai[4]}
+    except Exception:
+        return set()
+
+async def _dns_wildcard_check(domain: str, probes: int = 3):
+    # Generate N random subdomains; if all resolve to the same non-empty IP set,
+    # assume DNS wildcarding and abort the brute-force.
+    ip_sets = []
+    labels = [f"{_rand_label()}.{domain.strip('.')}" for _ in range(probes)]
+    for q in labels:
+        ips = await _get_ips_via_system(q)
+        ip_sets.append(ips)
+    # All must be non-empty and identical
+    all_non_empty = all(len(s) > 0 for s in ip_sets)
+    unique_sets = {tuple(sorted(s)) for s in ip_sets}
+    if all_non_empty and len(unique_sets) == 1:
+        return True, list(unique_sets.pop())
+    return False, []
+# ---------------------------------------------------------------------------
 
 async def main():
     resolvers = [make_resolver(ns, INITIAL_TIMEOUT) for ns in DEFAULT_NAMESERVERS]
     init_resolver_state(len(resolvers))
     start_time = time.perf_counter()
 
+    # --- Abort early if wildcarding is detected ---
+    try:
+        is_wild, ips = await _dns_wildcard_check(PARENT)
+    except NameError:
+        # Fallback: if PARENT isn't defined, attempt to use TARGET or DOMAIN variables if present.
+        try:
+            is_wild, ips = await _dns_wildcard_check(TARGET)  # noqa
+        except Exception:
+            try:
+                is_wild, ips = await _dns_wildcard_check(DOMAIN)  # noqa
+            except Exception:
+                is_wild, ips = (False, [])
+    if is_wild:
+        sys.stderr.write(f"[abort] DNS wildcard detected for {PARENT if 'PARENT' in globals() else 'domain'} → {', '.join(ips)}; brute-force disabled.\n")
+        sys.stderr.flush()
+        return 2
+    # ------------------------------------------------
+
     async def _progress_task(progress, total, start_time):
         try:
             while True:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
                 render_progress_stderr(progress.get('processed', 0), total, start_time, progress.get('found', 0))
         except asyncio.CancelledError:
             return
