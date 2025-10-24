@@ -1,5 +1,3 @@
-import string
-import socket
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -17,12 +15,19 @@ Usage:
 Requires:
   pip install dnspython
 """
+import string
+import socket
 import asyncio
 import random
 import sys
 import shutil
 import math
 import time
+import os
+import json
+import re
+import urllib.error
+import urllib.request
 
 # Try to use uvloop for faster event loop if available
 try:
@@ -8443,7 +8448,8 @@ async def check_strict_wildcard(parent: str, resolvers: List[aresolver.Resolver]
     return False, union_ips
 async def worker(q: asyncio.Queue, parent: str, limiter,
                  resolvers: List[aresolver.Resolver], timeout_ref: dict,
-                 wildcard_ips: Set[str], progress: dict):
+                 wildcard_ips: Set[str], progress: dict,
+                 openai_labels: Optional[Set[str]] = None):
     while True:
         label = await q.get()
         try:
@@ -8459,6 +8465,8 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                 limiter.release()
             if addrs and (not wildcard_ips or not all(a in wildcard_ips for a in addrs)):
                 progress['found'] += 1
+                if openai_labels and label in openai_labels:
+                    progress['ai_found'] += 1
                 print(name)
             progress['processed'] += 1
         except Exception as e:
@@ -8618,6 +8626,174 @@ def render_progress_stderr(done, total, start_time, found):
 
 
 
+# --- OpenAI-assisted enumeration ------------------------------------
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+_LABEL_ALLOWED = set(string.ascii_lowercase + string.digits + "-")
+OPENAI_LABEL_ROUNDS = int(os.getenv("DNSMAP_OPENAI_ROUNDS", "3"))
+OPENAI_LABEL_TARGET_PER_ROUND = int(os.getenv("DNSMAP_OPENAI_TARGET_PER_ROUND", "100"))
+
+
+def _strip_order_prefix(text: str) -> str:
+    return re.sub(r"^[0-9]+[\.\)\-\s_]*", "", text)
+
+
+def _normalise_label(candidate: str, parent: str) -> Optional[str]:
+    label = _strip_order_prefix(candidate.strip().lower())
+    if not label:
+        return None
+    if label.endswith(f".{parent}"):
+        label = label[:-(len(parent) + 1)]
+    if "." in label:
+        return None
+    if label[0] == "-" or label[-1] == "-":
+        return None
+    if not set(label) <= _LABEL_ALLOWED:
+        return None
+    if len(label) > 63:
+        return None
+    return label
+
+
+async def _openai_chat(prompt: str, api_key: str, *, model: str = "gpt-4o", timeout: float = 90.0,
+                       retries: int = 2, max_tokens: int = 3000) -> Optional[str]:
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an OSINT and cybersecurity analyst with access to open web resources."
+                    "Use cert transparency logs sites such as crt.sh, DNS analytics sites such as rapiddns.io & dnsdumpster.com, search engines, leaked configuration snippets, GitHub."
+                    "Use any any online resources you deem suitable sources of domain name intelligence."
+                    "Return just the bare subdomain labels (subdomains only, no dots), one per line, with no commentary."
+                    "Return as many subdomains (labels) as you can. Focus on subdomains that are likely to be active. I.e. subdomains that resolve to an IP address."
+                )
+            },
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.25,
+        "max_tokens": max_tokens,
+        "n": 1,
+    }).encode("utf-8")
+
+    def _send(local_timeout: float):
+        req = urllib.request.Request(
+            OPENAI_CHAT_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=local_timeout) as resp:
+            return resp.read().decode("utf-8")
+
+    attempt = 0
+    while True:
+        try:
+            response = await asyncio.to_thread(_send, timeout)
+            break
+        except urllib.error.HTTPError as http_err:
+            try:
+                http_err.read()
+            except Exception:
+                pass
+            code = getattr(http_err, "code", "unknown")
+            sys.stderr.write(f"[warn] OpenAI HTTP error {code}\n"); sys.stderr.flush()
+            return None
+        except urllib.error.URLError as url_err:
+            attempt += 1
+            if attempt > retries:
+                sys.stderr.write(f"[warn] OpenAI request failed: {url_err.reason}\n"); sys.stderr.flush()
+                return None
+            await asyncio.sleep(2 * attempt)
+            continue
+        except Exception as exc:
+            sys.stderr.write(f"[warn] OpenAI request failed: {exc}\n"); sys.stderr.flush()
+            return None
+
+    try:
+        payload = json.loads(response)
+    except json.JSONDecodeError:
+        sys.stderr.write("[warn] OpenAI response was not valid JSON\n"); sys.stderr.flush()
+        return None
+
+    try:
+        return payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        sys.stderr.write("[warn] OpenAI response missing expected fields\n"); sys.stderr.flush()
+        return None
+
+
+def _extract_labels(content: str, parent: str) -> List[str]:
+    candidates = re.split(r"[\n,]+", content)
+    cleaned: List[str] = []
+    seen = set()
+    for cand in candidates:
+        label = _normalise_label(cand, parent)
+        if not label:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        cleaned.append(label)
+    return cleaned
+
+
+async def openai_fetch_labels(parent: str, base_labels: Set[str]) -> List[str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return []
+
+    dot_parent = parent.lstrip('.')
+    rounds = max(1, OPENAI_LABEL_ROUNDS)
+    min_expected = max(1, OPENAI_LABEL_TARGET_PER_ROUND)
+
+    lines = [
+        f"Identify subdomains under .{dot_parent}.",
+        f"Return at least {min_expected} subdomain labels (single label, no dots).",
+        "Return lowercase labels separated by commas. No commentary, numbering, or duplicates.",
+    ]
+    prompt = "\n".join(lines)
+
+    aggregate: List[str] = []
+    seen: Set[str] = {label.lower() for label in base_labels}
+
+    for round_index in range(rounds):
+        content = await _openai_chat(prompt, api_key, timeout=120.0, retries=3, max_tokens=4000)
+        if not content:
+            sys.stderr.write(f"[info] OpenAI round {round_index + 1} returned no content\n"); sys.stderr.flush()
+            continue
+
+        suggestions = _extract_labels(content, parent)
+        if not suggestions:
+            sys.stderr.write(f"[info] OpenAI round {round_index + 1} produced no parsable labels\n"); sys.stderr.flush()
+            continue
+
+        fresh = []
+        for label in suggestions:
+            lowered = label.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            aggregate.append(label)
+            fresh.append(label)
+
+        if fresh:
+            try:
+                sys.stderr.write(f"[info] OpenAI round {round_index + 1} produced {len(fresh)} new labels\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        else:
+            sys.stderr.write(f"[info] OpenAI round {round_index + 1} only returned duplicates\n"); sys.stderr.flush()
+
+    if not aggregate:
+        sys.stderr.write("[info] OpenAI produced no new subdomain labels across all rounds\n"); sys.stderr.flush()
+
+    return aggregate
+# --------------------------------------------------------------------
 # --- Wildcard pre-check (fast, low-code) ------------------------------------
 def _rand_label(n: int = 16) -> str:
     alphabet = string.ascii_lowercase + string.digits
@@ -8707,18 +8883,44 @@ async def main():
     q = asyncio.Queue()
     limiter = DynamicSemaphore(INITIAL_CONCURRENCY)
     timeout_ref = {'value': INITIAL_TIMEOUT}
-    progress = {'processed': 0, 'attempted': 0, 'found': 0}
-    _labels = list(subs_set)
-    total_labels = len(_labels)
+    progress = {'processed': 0, 'attempted': 0, 'found': 0, 'ai_found': 0}
+
+    base_labels_list = [str(s).strip().lower() for s in subs_set if str(s).strip()]
+    base_labels_set = set(base_labels_list)
+    builtin_count = len(base_labels_list)
+    openai_labels: List[str] = []
+    openai_label_set: Set[str] = set()
+
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            sys.stderr.write("[info] initiating AI-powered subdomain enumeration...\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        openai_labels = await openai_fetch_labels(PARENT, base_labels_set)
+        for label in openai_labels:
+            norm = str(label).strip().lower()
+            if not norm or norm in base_labels_set:
+                continue
+            base_labels_set.add(norm)
+            base_labels_list.append(norm)
+        openai_label_set = {str(label).strip().lower() for label in openai_labels if str(label).strip()}
+
+    total_labels = len(base_labels_list)
+    added_labels = total_labels - builtin_count
     try:
-        sys.stderr.write(f"[info] brute-force target count: {total_labels}\n")
+        if added_labels > 0:
+            sys.stderr.write(f"[info] brute-force target count: {builtin_count} (+{added_labels} from OpenAI)\n")
+        else:
+            sys.stderr.write(f"[info] brute-force target count: {total_labels}\n")
         sys.stderr.flush()
     except Exception:
         pass
-    for s in _labels:
+
+    for s in base_labels_list:
         await q.put(str(s).strip().lower())
     workers = [
-        asyncio.create_task(worker(q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips, progress))
+        asyncio.create_task(worker(q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips, progress, openai_label_set))
         for _ in range(INITIAL_CONCURRENCY)
     ]
 
@@ -8753,8 +8955,11 @@ async def main():
     duration = max(1e-6, end_time - start_time)
     attempted = progress.get("attempted", 0)
     found = progress.get("found", 0)
+    ai_found = progress.get("ai_found", 0)
     avg_per_sec = attempted / duration if duration > 0 else float(attempted)
-    sys.stderr.write(f"[stats] duration={duration:.2f}s attempted={attempted} found={found} avg_per_sec={avg_per_sec:.2f}\n")
+    sys.stderr.write(
+        f"[stats] duration={duration:.2f}s attempted={attempted} found={found} openai_found={ai_found} avg_per_sec={avg_per_sec:.2f}\n"
+    )
     sys.stderr.flush()
 
 
