@@ -9036,7 +9036,12 @@ async def main():
     init_resolver_state(len(resolvers))
     start_time = time.perf_counter()
 
-    # --- Abort early if wildcarding is detected ---
+    wildcard_detected = False
+    wildcard_ips: Set[str] = set()
+    wildcard_reasons: List[str] = []
+    target_display = PARENT if 'PARENT' in globals() else 'domain'
+
+    # --- Probe for wildcard behaviour (without aborting) ---
     try:
         is_wild, ips = await _dns_wildcard_check(PARENT)
     except NameError:
@@ -9049,41 +9054,46 @@ async def main():
             except Exception:
                 is_wild, ips = (False, [])
     if is_wild:
-        sys.stderr.write(f"[abort] DNS wildcard detected for {PARENT if 'PARENT' in globals() else 'domain'} → {', '.join(ips)}; brute-force disabled.\n")
-        sys.stderr.flush()
-        return 2
-    # ------------------------------------------------
+        wildcard_detected = True
+        if ips:
+            wildcard_ips.update(ips)
+        wildcard_reasons.append("system resolver probe")
 
-    # Robust strict wildcard check.
-    enabled, common_ips = await check_strict_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, need=3, max_probes=12)
-    if enabled:
-        sys.stderr.write(
-            f"[fatal] wildcard DNS detected: random labels consistently resolved to: {', '.join(sorted(common_ips))}.\n"
-            "Brute-force enumeration is not viable; aborting.\n"
-        )
-        sys.stderr.flush()
-        sys.exit(2)
+    strict_enabled, strict_ips = await check_strict_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, need=3, max_probes=12)
+    if strict_enabled:
+        wildcard_detected = True
+        wildcard_reasons.append("async resolver probe")
+    if strict_ips:
+        if strict_enabled or wildcard_detected:
+            wildcard_ips.update(strict_ips)
 
-    # Strict wildcard check: if 3 random subdomains resolve to the same IPs, stop.
-    enabled, common_ips = await check_strict_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, need=3)
-    if enabled:
-        sys.stderr.write(f"[fatal] wildcard DNS detected (all random labels map to: {', '.join(sorted(common_ips))}). Brute force is not viable; exiting.\n")
-        sys.stderr.flush()
-        return
-
-
-
-    wildcard_ips = await detect_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, probes=3)
-    if wildcard_ips:
-        sys.stderr.write(f"[info] wildcard detected; ignoring IPs: {', '.join(sorted(wildcard_ips))}\n")
-        sys.stderr.flush()
+    if wildcard_detected:
+        extra_ips = await detect_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, probes=3)
+        wildcard_ips.update(extra_ips)
+        try:
+            info_bits = []
+            if wildcard_reasons:
+                info_bits.append(f"reasons: {', '.join(wildcard_reasons)}")
+            if wildcard_ips:
+                info_bits.append(f"ignoring IPs: {', '.join(sorted(wildcard_ips))}")
+            detail = f" ({'; '.join(info_bits)})" if info_bits else ""
+            sys.stderr.write(f"[warn] wildcard DNS detected for {target_display}; built-in brute-force wordlist disabled{detail}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    else:
+        wildcard_ips.clear()
 
     q = asyncio.Queue()
     limiter = DynamicSemaphore(INITIAL_CONCURRENCY)
     timeout_ref = {'value': INITIAL_TIMEOUT}
-    base_labels_list = [str(s).strip().lower() for s in subs_set if str(s).strip()]
-    base_labels_set = set(base_labels_list)
-    builtin_count = len(base_labels_list)
+    base_labels_list: List[str] = []
+    base_labels_set: Set[str] = set()
+    builtin_count = 0
+    if not wildcard_detected:
+        base_labels_list = [str(s).strip().lower() for s in subs_set if str(s).strip()]
+        base_labels_set = set(base_labels_list)
+        builtin_count = len(base_labels_list)
 
     progress = {
         'processed': 0,
@@ -9127,10 +9137,16 @@ async def main():
     scrape_task = asyncio.create_task(scrape_fetch_labels(PARENT, progress_hook=phase_increment))
     openai_task = None
 
-    if os.getenv("OPENAI_API_KEY"):
+    if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
         progress['phase_total'] += OPENAI_LABEL_ROUNDS
         refresh_progress()
         openai_task = asyncio.create_task(openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment))
+    elif os.getenv("OPENAI_API_KEY") and wildcard_detected:
+        try:
+            sys.stderr.write("[info] OpenAI label generation skipped due to wildcard DNS detection\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     scrape_labels = await scrape_task
     for label in scrape_labels:
