@@ -8458,6 +8458,7 @@ async def check_strict_wildcard(parent: str, resolvers: List[aresolver.Resolver]
 async def worker(q: asyncio.Queue, parent: str, limiter,
                  resolvers: List[aresolver.Resolver], timeout_ref: dict,
                  wildcard_ips: Set[str], progress: dict,
+                 results: List[str],
                  openai_labels: Optional[Set[str]] = None,
                  scrape_labels: Optional[Set[str]] = None):
     while True:
@@ -8479,7 +8480,7 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                     progress['ai_found'] += 1
                 if scrape_labels and label in scrape_labels:
                     progress['scrape_found'] += 1
-                print(name)
+                results.append(name)
             progress['processed'] += 1
         except Exception as e:
             sys.stderr.write(f"[warn] worker error: {e}\n"); sys.stderr.flush()
@@ -8779,16 +8780,17 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook:
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for round_index, content in enumerate(responses, start=1):
+    total_labels = 0
+    total_new = 0
+
+    for content in responses:
         if isinstance(content, Exception) or not content:
-            sys.stderr.write(f"[info] OpenAI round {round_index} returned no content\n"); sys.stderr.flush()
             if progress_hook:
                 progress_hook(1)
             continue
 
         suggestions = _extract_labels(content, parent)
         if not suggestions:
-            sys.stderr.write(f"[info] OpenAI round {round_index} produced no parsable labels\n"); sys.stderr.flush()
             if progress_hook:
                 progress_hook(1)
             continue
@@ -8802,16 +8804,19 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook:
             aggregate.append(label)
             fresh.append(label)
 
-        if fresh:
-            try:
-                sys.stderr.write(f"[info] OpenAI round {round_index} produced {len(fresh)} new labels\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
-        else:
-            sys.stderr.write(f"[info] OpenAI round {round_index} only returned duplicates\n"); sys.stderr.flush()
+        total_labels += len(suggestions)
+        total_new += len(fresh)
         if progress_hook:
             progress_hook(1)
+
+    if total_labels or total_new:
+        try:
+            sys.stderr.write(
+                f"[info] OpenAI yielded {total_labels} labels, of which {total_new} are new\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     if not aggregate:
         sys.stderr.write("[info] OpenAI produced no new subdomain labels across all rounds\n"); sys.stderr.flush()
@@ -8883,6 +8888,7 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
     async def _scrape_one(name: str, url_template: str, fmt: str) -> Set[str]:
         url = url_template.format(domain=parent)
         new_labels: Set[str] = set()
+        total_count = 0
         try:
             raw = await asyncio.to_thread(_scrape_source, url)
             if raw:
@@ -8911,9 +8917,10 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                         candidates = _labels_from_hostname(host, parent)
                     else:
                         candidates = []
-                    for candidate in candidates:
-                        if candidate:
-                            new_labels.add(candidate)
+                    cleaned = [candidate for candidate in candidates if candidate]
+                    total_count += len(cleaned)
+                    for candidate in cleaned:
+                        new_labels.add(candidate)
         except Exception as exc:
             try:
                 sys.stderr.write(f"[warn] scrape {name} failed: {exc}\n")
@@ -8922,7 +8929,9 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                 pass
         finally:
             try:
-                sys.stderr.write(f"[info] scrape {name} yielded {len(new_labels)} new labels\n")
+                sys.stderr.write(
+                    f"[info] scrape {name} yielded {total_count} labels, of which {len(new_labels)} are new\n"
+                )
                 sys.stderr.flush()
             except Exception:
                 pass
@@ -9075,11 +9084,6 @@ async def main():
     openai_task = None
 
     if os.getenv("OPENAI_API_KEY"):
-        try:
-            sys.stderr.write("[info] initiating AI-powered subdomain enumeration...\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
         progress['phase_total'] += OPENAI_LABEL_ROUNDS
         refresh_progress()
         openai_task = asyncio.create_task(openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment))
@@ -9124,10 +9128,15 @@ async def main():
     except Exception:
         pass
 
+    found_names: List[str] = []
+
     for s in base_labels_list:
         await q.put(str(s).strip().lower())
     workers = [
-        asyncio.create_task(worker(q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips, progress, openai_label_set, scrape_label_set))
+        asyncio.create_task(worker(
+            q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips,
+            progress, found_names, openai_label_set, scrape_label_set
+        ))
         for _ in range(INITIAL_CONCURRENCY)
     ]
 
@@ -9154,6 +9163,9 @@ async def main():
         await tuner
     except asyncio.CancelledError:
         pass
+
+    for name in found_names:
+        print(name)
 
     # --- stats ---
     end_time = time.perf_counter()
