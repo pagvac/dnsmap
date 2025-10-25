@@ -89,8 +89,9 @@ SCRAPE_TIMEOUT = 15.0
 # -----------------------------------
 
 SCRAPE_SOURCES = (
-    ("hackertarget", "https://api.hackertarget.com/hostsearch/?q={domain}"),
-    ("crtsh", "https://crt.sh/csv?q={domain}"),
+    ("hackertarget", "https://api.hackertarget.com/hostsearch/?q={domain}", "csv"),
+    ("crtsh", "https://crt.sh/csv?q={domain}", "csv"),
+    ("anubis", "https://anubisdb.com/anubis/subdomains/{domain}", "json"),
 )
 
 # ---------- Full subdomain set (wrapped to ≤80 chars/line) ----------
@@ -8771,17 +8772,23 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook:
     aggregate: List[str] = []
     seen: Set[str] = {label.lower() for label in base_labels}
 
-    for round_index in range(rounds):
-        content = await _openai_chat(prompt, api_key, timeout=120.0, retries=3, max_tokens=4000)
-        if not content:
-            sys.stderr.write(f"[info] OpenAI round {round_index + 1} returned no content\n"); sys.stderr.flush()
+    tasks = [
+        asyncio.create_task(_openai_chat(prompt, api_key, timeout=120.0, retries=3, max_tokens=4000))
+        for _ in range(rounds)
+    ]
+
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for round_index, content in enumerate(responses, start=1):
+        if isinstance(content, Exception) or not content:
+            sys.stderr.write(f"[info] OpenAI round {round_index} returned no content\n"); sys.stderr.flush()
             if progress_hook:
                 progress_hook(1)
             continue
 
         suggestions = _extract_labels(content, parent)
         if not suggestions:
-            sys.stderr.write(f"[info] OpenAI round {round_index + 1} produced no parsable labels\n"); sys.stderr.flush()
+            sys.stderr.write(f"[info] OpenAI round {round_index} produced no parsable labels\n"); sys.stderr.flush()
             if progress_hook:
                 progress_hook(1)
             continue
@@ -8797,12 +8804,12 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook:
 
         if fresh:
             try:
-                sys.stderr.write(f"[info] OpenAI round {round_index + 1} produced {len(fresh)} new labels\n")
+                sys.stderr.write(f"[info] OpenAI round {round_index} produced {len(fresh)} new labels\n")
                 sys.stderr.flush()
             except Exception:
                 pass
         else:
-            sys.stderr.write(f"[info] OpenAI round {round_index + 1} only returned duplicates\n"); sys.stderr.flush()
+            sys.stderr.write(f"[info] OpenAI round {round_index} only returned duplicates\n"); sys.stderr.flush()
         if progress_hook:
             progress_hook(1)
 
@@ -8873,39 +8880,64 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
 
     labels: Set[str] = set()
 
-    for name, url_template in SCRAPE_SOURCES:
+    async def _scrape_one(name: str, url_template: str, fmt: str) -> Set[str]:
         url = url_template.format(domain=parent)
-        raw = await asyncio.to_thread(_scrape_source, url)
-        if not raw:
-            continue
-        rows = _parse_csv_lines(raw)
-        new_count = 0
-        for row in rows:
-            if not row:
-                continue
-            if name == "hackertarget":
-                host = row[0].strip().lower()
-                candidates = _labels_from_hostname(host, parent)
-            elif name == "crtsh":
-                # CSV layout: id, issuer_ca_id, issuer_name, common_name, name_value, ...
-                name_value = row[3] if len(row) > 3 else ""
-                values = name_value.replace("\\n", "\n").splitlines()
-                candidates = []
-                for host in values:
-                    candidates.extend(_labels_from_hostname(host, parent))
-            else:
-                candidates = []
-            for label in candidates:
-                if label and label not in labels:
-                    labels.add(label)
-                    new_count += 1
+        new_labels: Set[str] = set()
         try:
-            sys.stderr.write(f"[info] scrape {name} yielded {new_count} new labels\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-        if progress_hook:
-            progress_hook(1)
+            raw = await asyncio.to_thread(_scrape_source, url)
+            if raw:
+                if fmt == "json":
+                    try:
+                        hosts = json.loads(raw)
+                    except json.JSONDecodeError:
+                        hosts = []
+                    rows = [[host] for host in hosts if isinstance(host, str)]
+                else:
+                    rows = _parse_csv_lines(raw)
+                for row in rows:
+                    if not row:
+                        continue
+                    if name == "hackertarget":
+                        host = row[0].strip().lower()
+                        candidates = _labels_from_hostname(host, parent)
+                    elif name == "crtsh":
+                        name_value = row[3] if len(row) > 3 else ""
+                        values = name_value.replace("\\n", "\n").splitlines()
+                        candidates = []
+                        for host in values:
+                            candidates.extend(_labels_from_hostname(host, parent))
+                    elif name == "anubis":
+                        host = row[0].strip().lower()
+                        candidates = _labels_from_hostname(host, parent)
+                    else:
+                        candidates = []
+                    for candidate in candidates:
+                        if candidate:
+                            new_labels.add(candidate)
+        except Exception as exc:
+            try:
+                sys.stderr.write(f"[warn] scrape {name} failed: {exc}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        finally:
+            try:
+                sys.stderr.write(f"[info] scrape {name} yielded {len(new_labels)} new labels\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if progress_hook:
+                progress_hook(1)
+        return new_labels
+
+    results = await asyncio.gather(
+        *[asyncio.create_task(_scrape_one(name, url, fmt)) for name, url, fmt in SCRAPE_SOURCES],
+        return_exceptions=True
+    )
+
+    for subset in results:
+        if isinstance(subset, set):
+            labels.update(subset)
 
     if not labels:
         try:
@@ -9039,7 +9071,20 @@ async def main():
     scrape_label_set: Set[str] = set()
     scrape_added = 0
 
-    scrape_labels = await scrape_fetch_labels(PARENT, progress_hook=phase_increment)
+    scrape_task = asyncio.create_task(scrape_fetch_labels(PARENT, progress_hook=phase_increment))
+    openai_task = None
+
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            sys.stderr.write("[info] initiating AI-powered subdomain enumeration...\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        progress['phase_total'] += OPENAI_LABEL_ROUNDS
+        refresh_progress()
+        openai_task = asyncio.create_task(openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment))
+
+    scrape_labels = await scrape_task
     for label in scrape_labels:
         norm = str(label).strip().lower()
         if not norm or norm in base_labels_set:
@@ -9051,15 +9096,8 @@ async def main():
     progress['total_labels'] = len(base_labels_list)
     refresh_progress()
 
-    if os.getenv("OPENAI_API_KEY"):
-        try:
-            sys.stderr.write("[info] initiating AI-powered subdomain enumeration...\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-        progress['phase_total'] += OPENAI_LABEL_ROUNDS
-        refresh_progress()
-        openai_labels = await openai_fetch_labels(PARENT, base_labels_set, progress_hook=phase_increment)
+    if openai_task:
+        openai_labels = await openai_task
         for label in openai_labels:
             norm = str(label).strip().lower()
             if not norm or norm in base_labels_set:
