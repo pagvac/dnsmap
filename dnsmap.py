@@ -26,6 +26,8 @@ import time
 import os
 import json
 import re
+import csv
+import io
 import urllib.error
 import urllib.request
 
@@ -83,7 +85,13 @@ RAMP_MIN_SAMPLES = 200
 # ---------- Initial seeds ----------
 INITIAL_CONCURRENCY = 256
 INITIAL_TIMEOUT = 1.0
+SCRAPE_TIMEOUT = 15.0
 # -----------------------------------
+
+SCRAPE_SOURCES = (
+    ("hackertarget", "https://api.hackertarget.com/hostsearch/?q={domain}"),
+    ("crtsh", "https://crt.sh/csv?q={domain}"),
+)
 
 # ---------- Full subdomain set (wrapped to ≤80 chars/line) ----------
 subs_set = {
@@ -8449,7 +8457,8 @@ async def check_strict_wildcard(parent: str, resolvers: List[aresolver.Resolver]
 async def worker(q: asyncio.Queue, parent: str, limiter,
                  resolvers: List[aresolver.Resolver], timeout_ref: dict,
                  wildcard_ips: Set[str], progress: dict,
-                 openai_labels: Optional[Set[str]] = None):
+                 openai_labels: Optional[Set[str]] = None,
+                 scrape_labels: Optional[Set[str]] = None):
     while True:
         label = await q.get()
         try:
@@ -8467,6 +8476,8 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                 progress['found'] += 1
                 if openai_labels and label in openai_labels:
                     progress['ai_found'] += 1
+                if scrape_labels and label in scrape_labels:
+                    progress['scrape_found'] += 1
                 print(name)
             progress['processed'] += 1
         except Exception as e:
@@ -8794,6 +8805,108 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str]) -> List[str]:
 
     return aggregate
 # --------------------------------------------------------------------
+
+
+def _labels_from_hostname(hostname: str, parent: str) -> List[str]:
+    hostname = hostname.strip().lower()
+    parent = parent.strip('.').lower()
+    if not hostname or hostname == parent:
+        return []
+    if hostname.endswith("." + parent):
+        remainder = hostname[:-(len(parent) + 1)]
+    elif hostname == parent:
+        remainder = ""
+    else:
+        return []
+    if not remainder:
+        return []
+    parts = [p for p in remainder.split('.') if p]
+    return parts
+
+
+def _scrape_source(url: str) -> Optional[str]:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "dnsmap/0.40 (+https://github.com/hackertarget/dnsmap)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SCRAPE_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as err:
+        try:
+            sys.stderr.write(f"[warn] scrape HTTP error {err.code} fetching {url}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    except urllib.error.URLError as err:
+        try:
+            sys.stderr.write(f"[warn] scrape URL error {err.reason} fetching {url}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            sys.stderr.write(f"[warn] scrape error {exc} fetching {url}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    return None
+
+
+def _parse_csv_lines(data: str) -> List[List[str]]:
+    if not data:
+        return []
+    reader = csv.reader(io.StringIO(data))
+    return [row for row in reader if row]
+
+
+async def scrape_fetch_labels(parent: str) -> Set[str]:
+    parent = parent.strip('.').lower()
+    if not parent:
+        return set()
+
+    labels: Set[str] = set()
+
+    for name, url_template in SCRAPE_SOURCES:
+        url = url_template.format(domain=parent)
+        raw = await asyncio.to_thread(_scrape_source, url)
+        if not raw:
+            continue
+        rows = _parse_csv_lines(raw)
+        new_count = 0
+        for row in rows:
+            if not row:
+                continue
+            if name == "hackertarget":
+                host = row[0].strip().lower()
+                candidates = _labels_from_hostname(host, parent)
+            elif name == "crtsh":
+                # CSV layout: id, issuer_ca_id, issuer_name, common_name, name_value, ...
+                name_value = row[3] if len(row) > 3 else ""
+                values = name_value.replace("\\n", "\n").splitlines()
+                candidates = []
+                for host in values:
+                    candidates.extend(_labels_from_hostname(host, parent))
+            else:
+                candidates = []
+            for label in candidates:
+                if label and label not in labels:
+                    labels.add(label)
+                    new_count += 1
+        try:
+            sys.stderr.write(f"[info] scrape {name} yielded {new_count} new labels\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    if not labels:
+        try:
+            sys.stderr.write("[info] scrape sources produced no labels\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    return labels
 # --- Wildcard pre-check (fast, low-code) ------------------------------------
 def _rand_label(n: int = 16) -> str:
     alphabet = string.ascii_lowercase + string.digits
@@ -8883,13 +8996,25 @@ async def main():
     q = asyncio.Queue()
     limiter = DynamicSemaphore(INITIAL_CONCURRENCY)
     timeout_ref = {'value': INITIAL_TIMEOUT}
-    progress = {'processed': 0, 'attempted': 0, 'found': 0, 'ai_found': 0}
+    progress = {'processed': 0, 'attempted': 0, 'found': 0, 'ai_found': 0, 'scrape_found': 0}
 
     base_labels_list = [str(s).strip().lower() for s in subs_set if str(s).strip()]
     base_labels_set = set(base_labels_list)
     builtin_count = len(base_labels_list)
     openai_labels: List[str] = []
     openai_label_set: Set[str] = set()
+    scrape_label_set: Set[str] = set()
+    scrape_added = 0
+
+    scrape_labels = await scrape_fetch_labels(PARENT)
+    for label in scrape_labels:
+        norm = str(label).strip().lower()
+        if not norm or norm in base_labels_set:
+            continue
+        base_labels_set.add(norm)
+        base_labels_list.append(norm)
+        scrape_added += 1
+    scrape_label_set = {str(label).strip().lower() for label in scrape_labels if str(label).strip()}
 
     if os.getenv("OPENAI_API_KEY"):
         try:
@@ -8907,10 +9032,15 @@ async def main():
         openai_label_set = {str(label).strip().lower() for label in openai_labels if str(label).strip()}
 
     total_labels = len(base_labels_list)
-    added_labels = total_labels - builtin_count
+    openai_added = max(0, total_labels - builtin_count - scrape_added)
     try:
-        if added_labels > 0:
-            sys.stderr.write(f"[info] brute-force target count: {builtin_count} (+{added_labels} from OpenAI)\n")
+        extra_bits = []
+        if scrape_added > 0:
+            extra_bits.append(f"+{scrape_added} from scraping")
+        if openai_added > 0:
+            extra_bits.append(f"+{openai_added} from OpenAI")
+        if extra_bits:
+            sys.stderr.write(f"[info] brute-force target count: {total_labels} ({', '.join(extra_bits)})\n")
         else:
             sys.stderr.write(f"[info] brute-force target count: {total_labels}\n")
         sys.stderr.flush()
@@ -8920,7 +9050,7 @@ async def main():
     for s in base_labels_list:
         await q.put(str(s).strip().lower())
     workers = [
-        asyncio.create_task(worker(q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips, progress, openai_label_set))
+        asyncio.create_task(worker(q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips, progress, openai_label_set, scrape_label_set))
         for _ in range(INITIAL_CONCURRENCY)
     ]
 
@@ -8956,14 +9086,20 @@ async def main():
     attempted = progress.get("attempted", 0)
     found = progress.get("found", 0)
     ai_found = progress.get("ai_found", 0)
+    scrape_found = progress.get("scrape_found", 0)
     avg_per_sec = attempted / duration if duration > 0 else float(attempted)
     sys.stderr.write(
-        f"[stats] duration={duration:.2f}s attempted={attempted} found={found} openai_found={ai_found} avg_per_sec={avg_per_sec:.2f}\n"
+        f"[stats] duration={duration:.2f}s attempted={attempted} found={found} openai_found={ai_found} scrape_found={scrape_found} avg_per_sec={avg_per_sec:.2f}\n"
     )
     sys.stderr.flush()
 
 
 if __name__ == '__main__':
+    try:
+        sys.stderr.write("dnsmap 0.40 - DNS Network Mapper by github.com/pagvac\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
