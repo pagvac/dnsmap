@@ -40,7 +40,7 @@ except Exception:
 
 from collections import deque, defaultdict
 from time import monotonic
-from typing import Set, List, Dict, Tuple, Optional
+from typing import Set, List, Dict, Tuple, Optional, Callable
 
 import dns.asyncresolver as aresolver
 import dns.exception
@@ -8522,7 +8522,7 @@ async def adjuster_task(limiter, resolvers: List[aresolver.Resolver],
         ); sys.stderr.flush()
 
 if len(sys.argv) < 2:
-    sys.stderr.write('Parent domain required, e.g., python dnsmap_async_tuned_full.py example.com\n')
+    sys.stderr.write('Parent domain required, e.g., python dnsmap.py example.com\n')
     sys.exit(2)
 PARENT = sys.argv[1].strip().lower()
 if '.' not in PARENT:
@@ -8752,7 +8752,7 @@ def _extract_labels(content: str, parent: str) -> List[str]:
     return cleaned
 
 
-async def openai_fetch_labels(parent: str, base_labels: Set[str]) -> List[str]:
+async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook: Optional[Callable[[int], None]] = None) -> List[str]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return []
@@ -8775,11 +8775,15 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str]) -> List[str]:
         content = await _openai_chat(prompt, api_key, timeout=120.0, retries=3, max_tokens=4000)
         if not content:
             sys.stderr.write(f"[info] OpenAI round {round_index + 1} returned no content\n"); sys.stderr.flush()
+            if progress_hook:
+                progress_hook(1)
             continue
 
         suggestions = _extract_labels(content, parent)
         if not suggestions:
             sys.stderr.write(f"[info] OpenAI round {round_index + 1} produced no parsable labels\n"); sys.stderr.flush()
+            if progress_hook:
+                progress_hook(1)
             continue
 
         fresh = []
@@ -8799,6 +8803,8 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str]) -> List[str]:
                 pass
         else:
             sys.stderr.write(f"[info] OpenAI round {round_index + 1} only returned duplicates\n"); sys.stderr.flush()
+        if progress_hook:
+            progress_hook(1)
 
     if not aggregate:
         sys.stderr.write("[info] OpenAI produced no new subdomain labels across all rounds\n"); sys.stderr.flush()
@@ -8860,7 +8866,7 @@ def _parse_csv_lines(data: str) -> List[List[str]]:
     return [row for row in reader if row]
 
 
-async def scrape_fetch_labels(parent: str) -> Set[str]:
+async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int], None]] = None) -> Set[str]:
     parent = parent.strip('.').lower()
     if not parent:
         return set()
@@ -8898,6 +8904,8 @@ async def scrape_fetch_labels(parent: str) -> Set[str]:
             sys.stderr.flush()
         except Exception:
             pass
+        if progress_hook:
+            progress_hook(1)
 
     if not labels:
         try:
@@ -8961,14 +8969,6 @@ async def main():
         return 2
     # ------------------------------------------------
 
-    async def _progress_task(progress, total, start_time):
-        try:
-            while True:
-                await asyncio.sleep(0.5)
-                render_progress_stderr(progress.get('processed', 0), total, start_time, progress.get('found', 0))
-        except asyncio.CancelledError:
-            return
-
     # Robust strict wildcard check.
     enabled, common_ips = await check_strict_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, need=3, max_probes=12)
     if enabled:
@@ -8996,17 +8996,50 @@ async def main():
     q = asyncio.Queue()
     limiter = DynamicSemaphore(INITIAL_CONCURRENCY)
     timeout_ref = {'value': INITIAL_TIMEOUT}
-    progress = {'processed': 0, 'attempted': 0, 'found': 0, 'ai_found': 0, 'scrape_found': 0}
-
     base_labels_list = [str(s).strip().lower() for s in subs_set if str(s).strip()]
     base_labels_set = set(base_labels_list)
     builtin_count = len(base_labels_list)
+
+    progress = {
+        'processed': 0,
+        'attempted': 0,
+        'found': 0,
+        'ai_found': 0,
+        'scrape_found': 0,
+        'phase_completed': 0,
+        'phase_total': len(SCRAPE_SOURCES),
+        'total_labels': builtin_count,
+    }
+
+    def refresh_progress():
+        total_labels = progress.get('total_labels', 0)
+        phase_total = progress.get('phase_total', 0)
+        phase_weight = max(total_labels // 20, 1) if phase_total else 1
+        total_units = total_labels + phase_total * phase_weight
+        done_units = progress.get('processed', 0) + progress.get('phase_completed', 0) * phase_weight
+        render_progress_stderr(done_units, total_units if total_units else 1, start_time, progress.get('found', 0))
+
+    def phase_increment(units: int = 1):
+        progress['phase_completed'] += units
+        refresh_progress()
+
+    async def _progress_task():
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                refresh_progress()
+        except asyncio.CancelledError:
+            return
+
+    refresh_progress()
+    prog = asyncio.create_task(_progress_task())
+
     openai_labels: List[str] = []
     openai_label_set: Set[str] = set()
     scrape_label_set: Set[str] = set()
     scrape_added = 0
 
-    scrape_labels = await scrape_fetch_labels(PARENT)
+    scrape_labels = await scrape_fetch_labels(PARENT, progress_hook=phase_increment)
     for label in scrape_labels:
         norm = str(label).strip().lower()
         if not norm or norm in base_labels_set:
@@ -9015,6 +9048,8 @@ async def main():
         base_labels_list.append(norm)
         scrape_added += 1
     scrape_label_set = {str(label).strip().lower() for label in scrape_labels if str(label).strip()}
+    progress['total_labels'] = len(base_labels_list)
+    refresh_progress()
 
     if os.getenv("OPENAI_API_KEY"):
         try:
@@ -9022,7 +9057,9 @@ async def main():
             sys.stderr.flush()
         except Exception:
             pass
-        openai_labels = await openai_fetch_labels(PARENT, base_labels_set)
+        progress['phase_total'] += OPENAI_LABEL_ROUNDS
+        refresh_progress()
+        openai_labels = await openai_fetch_labels(PARENT, base_labels_set, progress_hook=phase_increment)
         for label in openai_labels:
             norm = str(label).strip().lower()
             if not norm or norm in base_labels_set:
@@ -9030,6 +9067,8 @@ async def main():
             base_labels_set.add(norm)
             base_labels_list.append(norm)
         openai_label_set = {str(label).strip().lower() for label in openai_labels if str(label).strip()}
+        progress['total_labels'] = len(base_labels_list)
+        refresh_progress()
 
     total_labels = len(base_labels_list)
     openai_added = max(0, total_labels - builtin_count - scrape_added)
@@ -9056,19 +9095,17 @@ async def main():
 
     tuner = asyncio.create_task(adjuster_task(limiter, resolvers, q, timeout_ref))
 
-    prog = asyncio.create_task(_progress_task(progress, total_labels, start_time))
-
     await q.join()
 
     for _ in workers:
         await q.put(None)
     await asyncio.gather(*workers, return_exceptions=True)
+    refresh_progress()
     try:
         prog.cancel()
         await prog
     except Exception:
         pass
-    render_progress_stderr(progress.get('processed', 0), total_labels, start_time, progress.get('found', 0))
     try:
         sys.stderr.write('\n')
         sys.stderr.flush()
