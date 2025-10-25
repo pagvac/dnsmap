@@ -86,6 +86,10 @@ RAMP_MIN_SAMPLES = 200
 INITIAL_CONCURRENCY = 256
 INITIAL_TIMEOUT = 1.0
 SCRAPE_TIMEOUT = 15.0
+SCRAPE_MAX_RETRIES = 3
+SCRAPE_RETRY_BASE_DELAY = 1.5
+SCRAPE_RETRY_BACKOFF = 1.6
+SCRAPE_RETRY_JITTER = 0.25
 # -----------------------------------
 
 SCRAPE_SOURCES = (
@@ -8623,13 +8627,14 @@ def render_progress_stderr(done, total, start_time, found):
     pct = 0 if total == 0 else min(100, int(done * 100 / total))
 
     # Build prototype to measure trailing width correctly
-    proto = f" {pct:3d}% [] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
+    prefix = "[info] "
+    proto = f"{prefix}{pct:3d}% [] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
     bar_space = max(10, width - (len(proto) - 2))
 
     filled = 0 if total == 0 else int(bar_space * (done / total))
     bar = "#" * filled + "-" * (bar_space - filled)
 
-    msg = f" {pct:3d}% [{bar}] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
+    msg = f"{prefix}{pct:3d}% [{bar}] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
     try:
         sys.stderr.write("\r" + msg.ljust(width)[:width])
         sys.stderr.flush()
@@ -8847,27 +8852,60 @@ def _scrape_source(url: str) -> Optional[str]:
         url,
         headers={"User-Agent": "dnsmap/0.40 (+https://github.com/hackertarget/dnsmap)"}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=SCRAPE_TIMEOUT) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
-    except urllib.error.HTTPError as err:
+
+    def _sleep_before_retry(attempt: int) -> None:
+        delay = SCRAPE_RETRY_BASE_DELAY * (SCRAPE_RETRY_BACKOFF ** (attempt - 1))
+        if SCRAPE_RETRY_JITTER > 0:
+            delay += random.random() * SCRAPE_RETRY_JITTER
+        time.sleep(delay)
+
+    for attempt in range(1, SCRAPE_MAX_RETRIES + 1):
         try:
-            sys.stderr.write(f"[warn] scrape HTTP error {err.code} fetching {url}\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-    except urllib.error.URLError as err:
-        try:
-            sys.stderr.write(f"[warn] scrape URL error {err.reason} fetching {url}\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-    except Exception as exc:
-        try:
-            sys.stderr.write(f"[warn] scrape error {exc} fetching {url}\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
+            with urllib.request.urlopen(req, timeout=SCRAPE_TIMEOUT) as resp:
+                return resp.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as err:
+            retry = err.code >= 500 and attempt < SCRAPE_MAX_RETRIES
+            try:
+                msg = f"[warn] scrape attempt {attempt}/{SCRAPE_MAX_RETRIES} HTTP {err.code} fetching {url}"
+                if retry:
+                    msg += "; retrying..."
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if retry:
+                _sleep_before_retry(attempt)
+                continue
+            break
+        except urllib.error.URLError as err:
+            reason = getattr(err, "reason", err)
+            retry = attempt < SCRAPE_MAX_RETRIES
+            try:
+                msg = f"[warn] scrape attempt {attempt}/{SCRAPE_MAX_RETRIES} URL error {reason} fetching {url}"
+                if retry:
+                    msg += "; retrying..."
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if retry:
+                _sleep_before_retry(attempt)
+                continue
+            break
+        except Exception as exc:
+            retry = attempt < SCRAPE_MAX_RETRIES
+            try:
+                msg = f"[warn] scrape attempt {attempt}/{SCRAPE_MAX_RETRIES} error {exc} fetching {url}"
+                if retry:
+                    msg += "; retrying..."
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if retry:
+                _sleep_before_retry(attempt)
+                continue
+            break
     return None
 
 
@@ -8907,8 +8945,14 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                         host = row[0].strip().lower()
                         candidates = _labels_from_hostname(host, parent)
                     elif name == "crtsh":
-                        name_value = row[3] if len(row) > 3 else ""
-                        values = name_value.replace("\\n", "\n").splitlines()
+                        fields = []
+                        if len(row) > 4 and row[4]:
+                            fields.append(row[4])
+                        if len(row) > 5 and row[5]:
+                            fields.append(row[5])
+                        values = []
+                        for field in fields:
+                            values.extend(field.replace("\\n", "\n").splitlines())
                         candidates = []
                         for host in values:
                             candidates.extend(_labels_from_hostname(host, parent))
