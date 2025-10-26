@@ -9106,13 +9106,8 @@ async def main():
         extra_ips = await detect_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, probes=3)
         wildcard_ips.update(extra_ips)
         try:
-            info_bits = []
-            if wildcard_reasons:
-                info_bits.append(f"reasons: {', '.join(wildcard_reasons)}")
-            if wildcard_ips:
-                info_bits.append(f"ignoring IPs: {', '.join(sorted(wildcard_ips))}")
-            detail = f" ({'; '.join(info_bits)})" if info_bits else ""
-            sys.stderr.write(f"[warn] wildcard DNS detected for {target_display}; built-in brute-force wordlist disabled{detail}\n")
+            reason_suffix = f" ({', '.join(wildcard_reasons)})" if wildcard_reasons else ""
+            sys.stderr.write(f"[warn] wildcard DNS detected for {target_display}{reason_suffix}; built-in brute-force wordlist disabled\n")
             sys.stderr.flush()
         except Exception:
             pass
