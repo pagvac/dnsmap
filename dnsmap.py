@@ -8831,20 +8831,50 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook:
 
 
 def _labels_from_hostname(hostname: str, parent: str) -> List[str]:
-    hostname = hostname.strip().lower()
+    hostname = hostname.strip().strip("\"'").lower()
     parent = parent.strip('.').lower()
+
+    if not hostname:
+        return []
+
+    if hostname.startswith("host:"):
+        hostname = hostname[5:].strip()
+    elif hostname.startswith("host "):
+        hostname = hostname[5:].strip()
+    elif hostname.startswith("host\t"):
+        hostname = hostname[5:].strip()
+
     if not hostname or hostname == parent:
         return []
+
+    if '*' in hostname:
+        return []
+
     if hostname.endswith("." + parent):
         remainder = hostname[:-(len(parent) + 1)]
     elif hostname == parent:
         remainder = ""
     else:
         return []
+
     if not remainder:
         return []
-    parts = [p for p in remainder.split('.') if p]
-    return parts
+
+    labels: List[str] = []
+    for part in remainder.split('.'):
+        part = part.strip()
+        if not part:
+            continue
+        if '*' in part:
+            continue
+        if part[0] == '-' or part[-1] == '-':
+            continue
+        if not set(part) <= _LABEL_ALLOWED:
+            continue
+        if len(part) > 63:
+            continue
+        labels.append(part)
+    return labels
 
 
 def _scrape_source(url: str) -> Optional[str]:
@@ -8866,7 +8896,7 @@ def _scrape_source(url: str) -> Optional[str]:
         except urllib.error.HTTPError as err:
             retry = err.code >= 500 and attempt < SCRAPE_MAX_RETRIES
             try:
-                msg = f"[warn] scrape attempt {attempt}/{SCRAPE_MAX_RETRIES} HTTP {err.code} fetching {url}"
+                msg = f"[warn] scraping attempt {attempt}/{SCRAPE_MAX_RETRIES} HTTP {err.code}"
                 if retry:
                     msg += "; retrying..."
                 sys.stderr.write(msg + "\n")
@@ -8881,7 +8911,7 @@ def _scrape_source(url: str) -> Optional[str]:
             reason = getattr(err, "reason", err)
             retry = attempt < SCRAPE_MAX_RETRIES
             try:
-                msg = f"[warn] scrape attempt {attempt}/{SCRAPE_MAX_RETRIES} URL error {reason} fetching {url}"
+                msg = f"[warn] scraping attempt {attempt}/{SCRAPE_MAX_RETRIES} URL error {reason}"
                 if retry:
                     msg += "; retrying..."
                 sys.stderr.write(msg + "\n")
@@ -8895,7 +8925,7 @@ def _scrape_source(url: str) -> Optional[str]:
         except Exception as exc:
             retry = attempt < SCRAPE_MAX_RETRIES
             try:
-                msg = f"[warn] scrape attempt {attempt}/{SCRAPE_MAX_RETRIES} error {exc} fetching {url}"
+                msg = f"[warn] scraping attempt {attempt}/{SCRAPE_MAX_RETRIES} error {exc}"
                 if retry:
                     msg += "; retrying..."
                 sys.stderr.write(msg + "\n")
@@ -8923,7 +8953,7 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
 
     labels: Set[str] = set()
 
-    async def _scrape_one(name: str, url_template: str, fmt: str) -> Set[str]:
+    async def _scrape_one(name: str, url_template: str, fmt: str) -> Tuple[Set[str], int]:
         url = url_template.format(domain=parent)
         new_labels: Set[str] = set()
         total_count = 0
@@ -8967,35 +8997,40 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                         new_labels.add(candidate)
         except Exception as exc:
             try:
-                sys.stderr.write(f"[warn] scrape {name} failed: {exc}\n")
+                sys.stderr.write(f"[warn] scraping source failed: {exc}\n")
                 sys.stderr.flush()
             except Exception:
                 pass
-        finally:
-            try:
-                sys.stderr.write(
-                    f"[info] scrape {name} yielded {total_count} labels, of which {len(new_labels)} are new\n"
-                )
-                sys.stderr.flush()
-            except Exception:
-                pass
-            if progress_hook:
-                progress_hook(1)
-        return new_labels
+        return new_labels, total_count
 
     results = await asyncio.gather(
         *[asyncio.create_task(_scrape_one(name, url, fmt)) for name, url, fmt in SCRAPE_SOURCES],
         return_exceptions=True
     )
 
+    total_candidates = 0
     for subset in results:
-        if isinstance(subset, set):
+        if isinstance(subset, tuple):
+            subset_labels, count = subset
+            labels.update(subset_labels)
+            total_candidates += count
+        elif isinstance(subset, set):
             labels.update(subset)
+            total_candidates += len(subset)
 
-    if not labels:
+    unique_count = len(labels)
+    try:
+        if total_candidates:
+            sys.stderr.write(f"[info] scraping sources yielded {total_candidates} labels, of which {unique_count} are unique\n")
+        else:
+            sys.stderr.write("[info] scraping sources produced no labels\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    if progress_hook:
         try:
-            sys.stderr.write("[info] scrape sources produced no labels\n")
-            sys.stderr.flush()
+            progress_hook(1)
         except Exception:
             pass
 
@@ -9102,7 +9137,7 @@ async def main():
         'ai_found': 0,
         'scrape_found': 0,
         'phase_completed': 0,
-        'phase_total': len(SCRAPE_SOURCES),
+        'phase_total': 1,
         'total_labels': builtin_count,
     }
 
