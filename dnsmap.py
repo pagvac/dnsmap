@@ -43,7 +43,7 @@ except Exception:
 
 from collections import deque, defaultdict
 from time import monotonic
-from typing import Set, List, Dict, Tuple, Optional, Callable
+from typing import Set, List, Dict, Tuple, Optional, Callable, Awaitable, Any
 
 import dns.asyncresolver as aresolver
 import dns.exception
@@ -94,6 +94,19 @@ SCRAPE_RETRY_BASE_DELAY = 1.5
 SCRAPE_RETRY_BACKOFF = 1.6
 SCRAPE_RETRY_JITTER = 0.25
 # -----------------------------------
+
+SPINNER_FRAMES = "|/-\\"
+DEBUG_WARN = bool(os.getenv("DNSMAP_DEBUG"))
+
+
+def _log_warning(message: str):
+    if not DEBUG_WARN:
+        return
+    try:
+        sys.stderr.write(f"[warn] {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 SCRAPE_SOURCES = (
     ("hackertarget", "https://api.hackertarget.com/hostsearch/?q={domain}", "csv"),
@@ -8494,7 +8507,7 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                 results.append(name)
             progress['processed'] += 1
         except Exception as e:
-            sys.stderr.write(f"[warn] worker error: {e}\n"); sys.stderr.flush()
+            _log_warning(f"worker error: {e}")
         finally:
             q.task_done()
 
@@ -8527,12 +8540,6 @@ async def adjuster_task(limiter, resolvers: List[aresolver.Resolver],
                 for r in resolvers:
                     r.timeout = new_timeout
                     r.lifetime = new_timeout
-
-        sys.stderr.write(
-            f"[tune] conc={limiter.limit} p90={(p90 if p90 is not None else -1):.0f}ms "
-            f"success={succ:.0%} timeouts={to_rate:.0%} samples={total} "
-            f"q={qsize} timeout={timeout_ref['value']:.1f}s\n"
-        ); sys.stderr.flush()
 
 if len(sys.argv) < 2:
     sys.stderr.write('Parent domain required, e.g., python dnsmap.py example.com\n')
@@ -8617,39 +8624,74 @@ def _term_width(default=80):
     except Exception:
         return default
 
-def _format_time(seconds):
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h:d}h{m:02d}m{s:02d}s"
-    elif m > 0:
-        return f"{m:d}m{s:02d}s"
-    return f"{s:d}s"
 
-def render_progress_stderr(done, total, start_time, found):
+def _phase_line(symbol: str, text: str, suffix: str = "", newline: bool = False):
     width = max(40, _term_width())
-    elapsed = time.perf_counter() - start_time
-    rate = done / elapsed if elapsed > 0 else 0.0
-    remaining = max(0.0, (total - done) / rate) if rate > 0 else 0.0
-    pct = 0 if total == 0 else min(100, int(done * 100 / total))
-
-    # Build prototype to measure trailing width correctly
-    prefix = "[info] "
-    proto = f"{prefix}{pct:3d}% [] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
-    bar_space = max(10, width - (len(proto) - 2))
-
-    filled = 0 if total == 0 else int(bar_space * (done / total))
-    bar = "#" * filled + "-" * (bar_space - filled)
-
-    msg = f"{prefix}{pct:3d}% [{bar}] {done}/{total} | found:{found} | {rate:5.1f}/s | eta:{_format_time(remaining)}"
+    line = f"\r{symbol} {text}{suffix}"
+    if newline:
+        line = line.ljust(width) + "\n"
+    else:
+        line = line.ljust(width)
     try:
-        sys.stderr.write("\r" + msg.ljust(width)[:width])
+        sys.stderr.write(line)
         sys.stderr.flush()
     except Exception:
         pass
-# ------------------------------------
 
 
+class Spinner:
+    def __init__(self, text: str, interval: float = 0.15, frames: str = SPINNER_FRAMES):
+        self.text = text
+        self.interval = interval
+        self.frames = frames
+        self._idx = 0
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if self._task is not None:
+            await self.stop()
+        self._running = True
+        self._task = asyncio.create_task(self._animate())
+
+    async def _animate(self):
+        try:
+            frame_count = len(self.frames)
+            while self._running and frame_count > 0:
+                symbol = self.frames[self._idx % frame_count]
+                self._idx += 1
+                _phase_line(symbol, self.text, " ...", newline=False)
+                await asyncio.sleep(self.interval)
+        except asyncio.CancelledError:
+            pass
+
+    async def stop(self, final_suffix: str = " (done)"):
+        if self._task is None:
+            _phase_line('>', self.text, final_suffix, newline=True)
+            return
+        self._running = False
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+        self._idx = 0
+        _phase_line('>', self.text, final_suffix, newline=True)
+
+
+async def run_with_spinner(coro: Awaitable[Any], text: str,
+                           success_suffix: str = " (done)", failure_suffix: str = " (failed)"):
+    spinner = Spinner(text)
+    await spinner.start()
+    try:
+        result = await coro
+    except Exception:
+        await spinner.stop(failure_suffix)
+        raise
+    else:
+        await spinner.stop(success_suffix)
+        return result
 
 # --- OpenAI-assisted enumeration ------------------------------------
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
@@ -8725,29 +8767,29 @@ async def _openai_chat(prompt: str, api_key: str, *, model: str = "gpt-4o", time
             except Exception:
                 pass
             code = getattr(http_err, "code", "unknown")
-            sys.stderr.write(f"[warn] OpenAI HTTP error {code}\n"); sys.stderr.flush()
+            _log_warning(f"OpenAI HTTP error {code}")
             return None
         except urllib.error.URLError as url_err:
             attempt += 1
             if attempt > retries:
-                sys.stderr.write(f"[warn] OpenAI request failed: {url_err.reason}\n"); sys.stderr.flush()
+                _log_warning(f"OpenAI request failed: {url_err.reason}")
                 return None
             await asyncio.sleep(2 * attempt)
             continue
         except Exception as exc:
-            sys.stderr.write(f"[warn] OpenAI request failed: {exc}\n"); sys.stderr.flush()
+            _log_warning(f"OpenAI request failed: {exc}")
             return None
 
     try:
         payload = json.loads(response)
     except json.JSONDecodeError:
-        sys.stderr.write("[warn] OpenAI response was not valid JSON\n"); sys.stderr.flush()
+        _log_warning("OpenAI response was not valid JSON")
         return None
 
     try:
         return payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        sys.stderr.write("[warn] OpenAI response missing expected fields\n"); sys.stderr.flush()
+        _log_warning("OpenAI response missing expected fields")
         return None
 
 
@@ -8820,18 +8862,6 @@ async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook:
         total_new += len(fresh)
         if progress_hook:
             progress_hook(1)
-
-    if total_labels or total_new:
-        try:
-            sys.stderr.write(
-                f"[info] OpenAI yielded {total_labels} labels, of which {total_new} are new\n"
-            )
-            sys.stderr.flush()
-        except Exception:
-            pass
-
-    if not aggregate:
-        sys.stderr.write("[info] OpenAI produced no new subdomain labels across all rounds\n"); sys.stderr.flush()
 
     return aggregate
 # --------------------------------------------------------------------
@@ -9016,44 +9046,40 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
 
     labels: Set[str] = set()
 
-    async def _scrape_one(name: str, url_template: str, fmt: str) -> Tuple[Set[str], int]:
+    async def _scrape_one(name: str, url_template: str, fmt: str) -> Set[str]:
         url = url_template.format(domain=parent)
         new_labels: Set[str] = set()
-        total_count = 0
         try:
             if fmt == "dnsdumpster":
                 domains, _raw_count = await asyncio.to_thread(_scrape_dnsdumpster, parent, SCRAPE_TIMEOUT)
                 for host in domains:
                     candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
-                    total_count += len(cleaned)
                     for candidate in cleaned:
                         new_labels.add(candidate)
-                return new_labels, total_count
+                return new_labels
 
             if name == "threatcrowd":
                 hosts = await asyncio.to_thread(_fetch_threatcrowd, parent, SCRAPE_TIMEOUT)
                 for host in hosts:
                     candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
-                    total_count += len(cleaned)
                     for candidate in cleaned:
                         new_labels.add(candidate)
-                return new_labels, total_count
+                return new_labels
 
             raw = await asyncio.to_thread(_scrape_source, url)
             if not raw:
-                return new_labels, total_count
+                return new_labels
 
             if name == "rapiddns":
                 domains = _extract_domains_from_text(raw, parent)
                 for host in domains:
                     candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
-                    total_count += len(cleaned)
                     for candidate in cleaned:
                         new_labels.add(candidate)
-                return new_labels, total_count
+                return new_labels
 
             if fmt == "json":
                 try:
@@ -9091,41 +9117,20 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                 else:
                     candidates = []
                 cleaned = [candidate for candidate in candidates if candidate]
-                total_count += len(cleaned)
                 for candidate in cleaned:
                     new_labels.add(candidate)
         except Exception as exc:
-            try:
-                sys.stderr.write(f"[warn] scraping source failed: {exc}\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
-        return new_labels, total_count
+            _log_warning(f"scraping source failed: {exc}")
+        return new_labels
 
     results = await asyncio.gather(
         *[asyncio.create_task(_scrape_one(name, url, fmt)) for name, url, fmt in SCRAPE_SOURCES],
         return_exceptions=True
     )
 
-    total_candidates = 0
     for subset in results:
-        if isinstance(subset, tuple):
-            subset_labels, count = subset
-            labels.update(subset_labels)
-            total_candidates += count
-        elif isinstance(subset, set):
+        if isinstance(subset, set):
             labels.update(subset)
-            total_candidates += len(subset)
-
-    unique_count = len(labels)
-    try:
-        if total_candidates:
-            sys.stderr.write(f"[info] scraping sources yielded {total_candidates} labels, of which {unique_count} are unique\n")
-        else:
-            sys.stderr.write("[info] scraping sources produced no labels\n")
-        sys.stderr.flush()
-    except Exception:
-        pass
 
     if progress_hook:
         try:
@@ -9204,12 +9209,8 @@ async def main():
     if wildcard_detected:
         extra_ips = await detect_wildcard(PARENT, resolvers, INITIAL_TIMEOUT, probes=3)
         wildcard_ips.update(extra_ips)
-        try:
-            reason_suffix = f" ({', '.join(wildcard_reasons)})" if wildcard_reasons else ""
-            sys.stderr.write(f"[warn] wildcard DNS detected for {target_display}{reason_suffix}; built-in brute-force wordlist disabled\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
+        reason_suffix = f" ({', '.join(wildcard_reasons)})" if wildcard_reasons else ""
+        _log_warning(f"wildcard DNS detected for {target_display}{reason_suffix}; built-in brute-force wordlist disabled")
     else:
         wildcard_ips.clear()
 
@@ -9236,61 +9237,43 @@ async def main():
     }
 
     def refresh_progress():
-        total_labels = progress.get('total_labels', 0)
-        phase_total = progress.get('phase_total', 0)
-        phase_weight = max(total_labels // 20, 1) if phase_total else 1
-        total_units = total_labels + phase_total * phase_weight
-        done_units = progress.get('processed', 0) + progress.get('phase_completed', 0) * phase_weight
-        render_progress_stderr(done_units, total_units if total_units else 1, start_time, progress.get('found', 0))
+        return
 
     def phase_increment(units: int = 1):
         progress['phase_completed'] += units
         refresh_progress()
 
-    async def _progress_task():
-        try:
-            while True:
-                await asyncio.sleep(0.5)
-                refresh_progress()
-        except asyncio.CancelledError:
-            return
-
     refresh_progress()
-    prog = asyncio.create_task(_progress_task())
 
     openai_labels: List[str] = []
     openai_label_set: Set[str] = set()
     scrape_label_set: Set[str] = set()
-    scrape_added = 0
 
-    scrape_task = asyncio.create_task(scrape_fetch_labels(PARENT, progress_hook=phase_increment))
-    openai_task = None
-
-    if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
-        progress['phase_total'] += OPENAI_LABEL_ROUNDS
-        refresh_progress()
-        openai_task = asyncio.create_task(openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment))
-    elif os.getenv("OPENAI_API_KEY") and wildcard_detected:
-        try:
-            sys.stderr.write("[info] OpenAI label generation skipped due to wildcard DNS detection\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-
-    scrape_labels = await scrape_task
+    scrape_labels = await run_with_spinner(
+        scrape_fetch_labels(PARENT, progress_hook=phase_increment),
+        "Querying scraping sources"
+    )
     for label in scrape_labels:
         norm = str(label).strip().lower()
         if not norm or norm in base_labels_set:
             continue
         base_labels_set.add(norm)
         base_labels_list.append(norm)
-        scrape_added += 1
     scrape_label_set = {str(label).strip().lower() for label in scrape_labels if str(label).strip()}
     progress['total_labels'] = len(base_labels_list)
     refresh_progress()
 
-    if openai_task:
-        openai_labels = await openai_task
+    if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
+        progress['phase_total'] += OPENAI_LABEL_ROUNDS
+        refresh_progress()
+        try:
+            openai_labels = await run_with_spinner(
+                openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment),
+                "Interacting with LLM"
+            )
+        except Exception as exc:
+            _log_warning(f"OpenAI label fetch failed: {exc}")
+            openai_labels = []
         for label in openai_labels:
             norm = str(label).strip().lower()
             if not norm or norm in base_labels_set:
@@ -9300,58 +9283,38 @@ async def main():
         openai_label_set = {str(label).strip().lower() for label in openai_labels if str(label).strip()}
         progress['total_labels'] = len(base_labels_list)
         refresh_progress()
-
-    total_labels = len(base_labels_list)
-    openai_added = max(0, total_labels - builtin_count - scrape_added)
-    try:
-        extra_bits = []
-        if scrape_added > 0:
-            extra_bits.append(f"+{scrape_added} from scraping")
-        if openai_added > 0:
-            extra_bits.append(f"+{openai_added} from OpenAI")
-        if extra_bits:
-            sys.stderr.write(f"[info] brute-force target count: {total_labels} ({', '.join(extra_bits)})\n")
-        else:
-            sys.stderr.write(f"[info] brute-force target count: {total_labels}\n")
-        sys.stderr.flush()
-    except Exception:
-        pass
+    elif os.getenv("OPENAI_API_KEY") and wildcard_detected:
+        _log_warning("OpenAI label generation skipped due to wildcard DNS detection")
 
     found_names: List[str] = []
 
-    for s in base_labels_list:
-        await q.put(str(s).strip().lower())
-    workers = [
-        asyncio.create_task(worker(
-            q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips,
-            progress, found_names, openai_label_set, scrape_label_set
-        ))
-        for _ in range(INITIAL_CONCURRENCY)
-    ]
-
-    tuner = asyncio.create_task(adjuster_task(limiter, resolvers, q, timeout_ref))
-
-    await q.join()
-
-    for _ in workers:
-        await q.put(None)
-    await asyncio.gather(*workers, return_exceptions=True)
-    refresh_progress()
+    brute_spinner = Spinner("Performing DNS bruteforcing using internal list")
+    await brute_spinner.start()
     try:
-        prog.cancel()
-        await prog
-    except Exception:
-        pass
-    try:
-        sys.stderr.write('\n')
-        sys.stderr.flush()
-    except Exception:
-        pass
-    tuner.cancel()
-    try:
-        await tuner
-    except asyncio.CancelledError:
-        pass
+        for s in base_labels_list:
+            await q.put(str(s).strip().lower())
+        workers = [
+            asyncio.create_task(worker(
+                q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips,
+                progress, found_names, openai_label_set, scrape_label_set
+            ))
+            for _ in range(INITIAL_CONCURRENCY)
+        ]
+
+        tuner = asyncio.create_task(adjuster_task(limiter, resolvers, q, timeout_ref))
+
+        await q.join()
+
+        for _ in workers:
+            await q.put(None)
+        await asyncio.gather(*workers, return_exceptions=True)
+        tuner.cancel()
+        try:
+            await tuner
+        except asyncio.CancelledError:
+            pass
+    finally:
+        await brute_spinner.stop()
 
     for name in found_names:
         print(name)
