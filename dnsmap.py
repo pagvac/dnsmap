@@ -567,7 +567,7 @@ def _normalise_label(candidate: str, parent: str) -> Optional[str]:
     return label
 
 
-async def _openai_chat(prompt: str, api_key: str, *, model: str = "gpt-4o", timeout: float = 90.0,
+async def _openai_chat(prompt: str, api_key: str, *, model: str = os.getenv("DNSMAP_OPENAI_MODEL", "gpt-4o-mini"), timeout: float = 90.0,
                        retries: int = 2, max_tokens: int = 3000) -> Optional[str]:
     body = json.dumps({
         "model": model,
