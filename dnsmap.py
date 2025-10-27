@@ -116,6 +116,7 @@ SCRAPE_SOURCES = (
     ("riddler", "https://riddler.io/search/exportcsv?q=pld:{domain}", "csv"),
     ("dnsdumpster", "https://api.dnsdumpster.com/htmld/", "dnsdumpster"),
     ("threatcrowd", "https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={domain}", "json"),
+    ("archive", "http://web.archive.org/cdx/search/cdx?url=*.{domain}", "archive"),
 )
 
 def fqdn(label: str, parent: str) -> str:
@@ -775,6 +776,32 @@ def _extract_domains_from_text(text: str, parent: str) -> Set[str]:
     return results
 
 
+def _extract_domains_from_cdx(text: str, parent: str) -> Set[str]:
+    parent = parent.strip('.').lower()
+    if not parent:
+        return set()
+    hosts: Set[str] = set()
+    for line in text.splitlines():
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        original_url = parts[2]
+        try:
+            parsed = urllib.parse.urlparse(original_url)
+        except Exception:
+            continue
+        netloc = parsed.netloc.lower()
+        if not netloc:
+            continue
+        host = netloc.split(":", 1)[0]
+        if host == parent or not host.endswith("." + parent):
+            continue
+        hosts.add(host)
+    return hosts
+
+
 def _scrape_dnsdumpster(parent: str, timeout: float) -> Tuple[Set[str], int]:
     headers = {
         "User-Agent": "dnsmap/0.40 (+https://github.com/hackertarget/dnsmap)",
@@ -920,6 +947,15 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
 
             if name == "rapiddns":
                 domains = _extract_domains_from_text(raw, parent)
+                for host in domains:
+                    candidates = _labels_from_hostname(host, parent)
+                    cleaned = [candidate for candidate in candidates if candidate]
+                    for candidate in cleaned:
+                        new_labels.add(candidate)
+                return new_labels
+
+            if name == "archive":
+                domains = _extract_domains_from_cdx(raw, parent)
                 for host in domains:
                     candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
