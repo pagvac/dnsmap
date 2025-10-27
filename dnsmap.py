@@ -30,6 +30,9 @@ import csv
 import io
 import urllib.error
 import urllib.request
+import urllib.parse
+import http.cookiejar
+import ssl
 
 # Try to use uvloop for faster event loop if available
 try:
@@ -96,6 +99,10 @@ SCRAPE_SOURCES = (
     ("hackertarget", "https://api.hackertarget.com/hostsearch/?q={domain}", "csv"),
     ("crtsh", "https://crt.sh/csv?q={domain}", "csv"),
     ("anubis", "https://anubisdb.com/anubis/subdomains/{domain}", "json"),
+    ("rapiddns", "https://rapiddns.io/subdomain/{domain}?full=1", "html"),
+    ("riddler", "https://riddler.io/search/exportcsv?q=pld:{domain}", "csv"),
+    ("dnsdumpster", "https://api.dnsdumpster.com/htmld/", "dnsdumpster"),
+    ("threatcrowd", "https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={domain}", "json"),
 )
 
 # ---------- Full subdomain set (wrapped to ≤80 chars/line) ----------
@@ -8877,6 +8884,86 @@ def _labels_from_hostname(hostname: str, parent: str) -> List[str]:
     return labels
 
 
+def _extract_domains_from_text(text: str, parent: str) -> Set[str]:
+    parent = parent.strip('.').lower()
+    if not parent:
+        return set()
+    pattern = re.compile(
+        rf'(?i)(?:^|[^a-z0-9_-])([a-z0-9][a-z0-9\-\.]*\.{re.escape(parent)})'
+    )
+    results: Set[str] = set()
+    for match in pattern.finditer(text):
+        host = match.group(1).strip().strip("\"'").lower()
+        if host:
+            results.add(host)
+    return results
+
+
+def _scrape_dnsdumpster(parent: str, timeout: float) -> Tuple[Set[str], int]:
+    headers = {
+        "User-Agent": "dnsmap/0.40 (+https://github.com/hackertarget/dnsmap)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        init_req = urllib.request.Request("https://dnsdumpster.com/", headers=headers)
+        with opener.open(init_req, timeout=timeout) as resp:
+            landing = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        raise
+
+    token = None
+    token_attr = re.search(r'hx-headers=([\'"])(\{.*?\})(\1)', landing)
+    if token_attr:
+        try:
+            payload = json.loads(token_attr.group(2))
+            if isinstance(payload, dict):
+                token = payload.get("Authorization")
+        except Exception:
+            token = None
+    if not token:
+        raise RuntimeError("dnsdumpster authorization token not found")
+
+    post_headers = headers.copy()
+    post_headers.update({
+        "Authorization": token,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://dnsdumpster.com",
+        "Referer": "https://dnsdumpster.com/",
+        "HX-Request": "true",
+        "HX-Trigger": "mainform",
+        "HX-Target": "#results",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    data = urllib.parse.urlencode({"target": parent.strip().lower()}).encode("utf-8")
+    req = urllib.request.Request("https://api.dnsdumpster.com/htmld/", data=data, headers=post_headers)
+    with opener.open(req, timeout=timeout) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+    domains = _extract_domains_from_text(html, parent)
+    return domains, len(domains)
+
+
+def _fetch_threatcrowd(parent: str, timeout: float) -> List[str]:
+    url = f"https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={urllib.parse.quote(parent)}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "dnsmap/0.40 (+https://github.com/hackertarget/dnsmap)"}
+    )
+    context = ssl._create_unverified_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(payload, dict):
+        subs = payload.get("subdomains")
+        if isinstance(subs, list):
+            return [str(item).strip().lower() for item in subs if isinstance(item, str)]
+    return []
+
+
 def _scrape_source(url: str) -> Optional[str]:
     req = urllib.request.Request(
         url,
@@ -8895,14 +8982,6 @@ def _scrape_source(url: str) -> Optional[str]:
                 return resp.read().decode("utf-8", errors="ignore")
         except urllib.error.HTTPError as err:
             retry = err.code >= 500 and attempt < SCRAPE_MAX_RETRIES
-            try:
-                msg = f"[warn] scraping attempt {attempt}/{SCRAPE_MAX_RETRIES} HTTP {err.code}"
-                if retry:
-                    msg += "; retrying..."
-                sys.stderr.write(msg + "\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
             if retry:
                 _sleep_before_retry(attempt)
                 continue
@@ -8910,28 +8989,12 @@ def _scrape_source(url: str) -> Optional[str]:
         except urllib.error.URLError as err:
             reason = getattr(err, "reason", err)
             retry = attempt < SCRAPE_MAX_RETRIES
-            try:
-                msg = f"[warn] scraping attempt {attempt}/{SCRAPE_MAX_RETRIES} URL error {reason}"
-                if retry:
-                    msg += "; retrying..."
-                sys.stderr.write(msg + "\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
             if retry:
                 _sleep_before_retry(attempt)
                 continue
             break
         except Exception as exc:
             retry = attempt < SCRAPE_MAX_RETRIES
-            try:
-                msg = f"[warn] scraping attempt {attempt}/{SCRAPE_MAX_RETRIES} error {exc}"
-                if retry:
-                    msg += "; retrying..."
-                sys.stderr.write(msg + "\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
             if retry:
                 _sleep_before_retry(attempt)
                 continue
@@ -8958,43 +9021,79 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
         new_labels: Set[str] = set()
         total_count = 0
         try:
-            raw = await asyncio.to_thread(_scrape_source, url)
-            if raw:
-                if fmt == "json":
-                    try:
-                        hosts = json.loads(raw)
-                    except json.JSONDecodeError:
-                        hosts = []
-                    rows = [[host] for host in hosts if isinstance(host, str)]
-                else:
-                    rows = _parse_csv_lines(raw)
-                for row in rows:
-                    if not row:
-                        continue
-                    if name == "hackertarget":
-                        host = row[0].strip().lower()
-                        candidates = _labels_from_hostname(host, parent)
-                    elif name == "crtsh":
-                        fields = []
-                        if len(row) > 4 and row[4]:
-                            fields.append(row[4])
-                        if len(row) > 5 and row[5]:
-                            fields.append(row[5])
-                        values = []
-                        for field in fields:
-                            values.extend(field.replace("\\n", "\n").splitlines())
-                        candidates = []
-                        for host in values:
-                            candidates.extend(_labels_from_hostname(host, parent))
-                    elif name == "anubis":
-                        host = row[0].strip().lower()
-                        candidates = _labels_from_hostname(host, parent)
-                    else:
-                        candidates = []
+            if fmt == "dnsdumpster":
+                domains, _raw_count = await asyncio.to_thread(_scrape_dnsdumpster, parent, SCRAPE_TIMEOUT)
+                for host in domains:
+                    candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
                     total_count += len(cleaned)
                     for candidate in cleaned:
                         new_labels.add(candidate)
+                return new_labels, total_count
+
+            if name == "threatcrowd":
+                hosts = await asyncio.to_thread(_fetch_threatcrowd, parent, SCRAPE_TIMEOUT)
+                for host in hosts:
+                    candidates = _labels_from_hostname(host, parent)
+                    cleaned = [candidate for candidate in candidates if candidate]
+                    total_count += len(cleaned)
+                    for candidate in cleaned:
+                        new_labels.add(candidate)
+                return new_labels, total_count
+
+            raw = await asyncio.to_thread(_scrape_source, url)
+            if not raw:
+                return new_labels, total_count
+
+            if name == "rapiddns":
+                domains = _extract_domains_from_text(raw, parent)
+                for host in domains:
+                    candidates = _labels_from_hostname(host, parent)
+                    cleaned = [candidate for candidate in candidates if candidate]
+                    total_count += len(cleaned)
+                    for candidate in cleaned:
+                        new_labels.add(candidate)
+                return new_labels, total_count
+
+            if fmt == "json":
+                try:
+                    hosts = json.loads(raw)
+                except json.JSONDecodeError:
+                    hosts = []
+                rows = [[host] for host in hosts if isinstance(host, str)]
+            else:
+                rows = _parse_csv_lines(raw)
+
+            for row in rows:
+                if not row:
+                    continue
+                if name == "hackertarget":
+                    host = row[0].strip().lower()
+                    candidates = _labels_from_hostname(host, parent)
+                elif name == "crtsh":
+                    fields = []
+                    if len(row) > 4 and row[4]:
+                        fields.append(row[4])
+                    if len(row) > 5 and row[5]:
+                        fields.append(row[5])
+                    values = []
+                    for field in fields:
+                        values.extend(field.replace("\\n", "\n").splitlines())
+                    candidates = []
+                    for host in values:
+                        candidates.extend(_labels_from_hostname(host, parent))
+                elif name == "anubis":
+                    host = row[0].strip().lower()
+                    candidates = _labels_from_hostname(host, parent)
+                elif name == "riddler":
+                    host = row[0].strip().lower()
+                    candidates = _labels_from_hostname(host, parent)
+                else:
+                    candidates = []
+                cleaned = [candidate for candidate in candidates if candidate]
+                total_count += len(cleaned)
+                for candidate in cleaned:
+                    new_labels.add(candidate)
         except Exception as exc:
             try:
                 sys.stderr.write(f"[warn] scraping source failed: {exc}\n")
