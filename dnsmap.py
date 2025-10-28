@@ -1028,7 +1028,7 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                 for candidate in cleaned:
                     new_labels.add(candidate)
         except Exception as exc:
-            _log_warning(f"scraping source failed: {exc}")
+            _log_warning(f"scraping source {name} failed: {exc}")
         return new_labels
 
     results = await asyncio.gather(
