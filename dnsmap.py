@@ -105,8 +105,7 @@ def _log_warning(message: str):
     if not (DEBUG_WARN or CLI_DEBUG):
         return
     try:
-        sys.stderr.write(f"[warn] {message}\n")
-        sys.stderr.flush()
+        _phase_line('!', f"[warn] {message}", newline=True)
     except Exception:
         pass
 
