@@ -97,10 +97,11 @@ SCRAPE_RETRY_JITTER = 0.25
 
 SPINNER_FRAMES = "|/-\\"
 DEBUG_WARN = bool(os.getenv("DNSMAP_DEBUG"))
+CLI_DEBUG = False
 
 
 def _log_warning(message: str):
-    if not DEBUG_WARN:
+    if not (DEBUG_WARN or CLI_DEBUG):
         return
     try:
         sys.stderr.write(f"[warn] {message}\n")
@@ -388,10 +389,22 @@ async def adjuster_task(limiter, resolvers: List[aresolver.Resolver],
                     r.timeout = new_timeout
                     r.lifetime = new_timeout
 
-if len(sys.argv) < 2:
+_domain_arg: Optional[str] = None
+_extra_args: List[str] = []
+for token in sys.argv[1:]:
+    if token in ("-d", "--debug"):
+        CLI_DEBUG = True
+        continue
+    if _domain_arg is None:
+        _domain_arg = token
+    else:
+        _extra_args.append(token)
+
+if not _domain_arg:
     sys.stderr.write('Parent domain required, e.g., python dnsmap.py example.com\n')
     sys.exit(2)
-PARENT = sys.argv[1].strip().lower()
+
+PARENT = _domain_arg.strip().lower()
 if '.' not in PARENT:
     sys.stderr.write('Parent domain must be like example.com\n')
     sys.exit(2)
@@ -912,12 +925,13 @@ def _parse_csv_lines(data: str) -> List[List[str]]:
     return [row for row in reader if row]
 
 
-async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int], None]] = None) -> Set[str]:
+async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int], None]] = None) -> Tuple[Set[str], Dict[str, Set[str]]]:
     parent = parent.strip('.').lower()
     if not parent:
-        return set()
+        return set(), {}
 
     labels: Set[str] = set()
+    source_map: Dict[str, Set[str]] = {}
 
     async def _scrape_one(name: str, url_template: str, fmt: str) -> Set[str]:
         url = url_template.format(domain=parent)
@@ -1010,9 +1024,12 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
         return_exceptions=True
     )
 
-    for subset in results:
+    for (name, _, _), subset in zip(SCRAPE_SOURCES, results):
         if isinstance(subset, set):
             labels.update(subset)
+            source_map[name] = subset
+        else:
+            source_map[name] = set()
 
     if progress_hook:
         try:
@@ -1020,7 +1037,7 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
         except Exception:
             pass
 
-    return labels
+    return labels, source_map
 # --- Wildcard pre-check (fast, low-code) ------------------------------------
 def _rand_label(n: int = 16) -> str:
     alphabet = string.ascii_lowercase + string.digits
@@ -1131,10 +1148,16 @@ async def main():
     openai_label_set: Set[str] = set()
     scrape_label_set: Set[str] = set()
 
-    scrape_labels = await run_with_spinner(
+    archive_total = 0
+    archive_new = 0
+
+    scrape_labels, scrape_source_map = await run_with_spinner(
         scrape_fetch_labels(PARENT, progress_hook=phase_increment),
         "Querying scraping sources"
     )
+    archive_labels = scrape_source_map.get("archive", set())
+    archive_total = len(archive_labels)
+    pre_scrape_base = set(base_labels_set)
     for label in scrape_labels:
         norm = str(label).strip().lower()
         if not norm or norm in base_labels_set:
@@ -1144,6 +1167,7 @@ async def main():
     scrape_label_set = {str(label).strip().lower() for label in scrape_labels if str(label).strip()}
     progress['total_labels'] = len(base_labels_list)
     refresh_progress()
+    archive_new = len([label for label in archive_labels if label not in pre_scrape_base])
 
     if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
         progress['phase_total'] += OPENAI_LABEL_ROUNDS
@@ -1209,9 +1233,13 @@ async def main():
     ai_found = progress.get("ai_found", 0)
     scrape_found = progress.get("scrape_found", 0)
     avg_per_sec = attempted / duration if duration > 0 else float(attempted)
-    sys.stderr.write(
-        f"[stats] duration={duration:.2f}s attempted={attempted} found={found} openai_found={ai_found} scrape_found={scrape_found} avg_per_sec={avg_per_sec:.2f}\n"
+    stats_line = (
+        f"[stats] duration={duration:.2f}s attempted={attempted} found={found} "
+        f"openai_found={ai_found} scrape_found={scrape_found} avg_per_sec={avg_per_sec:.2f}"
     )
+    if CLI_DEBUG:
+        stats_line += f" archive_total={archive_total} archive_new={archive_new}"
+    sys.stderr.write(stats_line + "\n")
     sys.stderr.flush()
 
 
