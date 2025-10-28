@@ -33,6 +33,7 @@ import urllib.request
 import urllib.parse
 import http.cookiejar
 import ssl
+import datetime
 
 # Try to use uvloop for faster event loop if available
 try:
@@ -934,7 +935,6 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
     source_map: Dict[str, Set[str]] = {}
 
     async def _scrape_one(name: str, url_template: str, fmt: str) -> Set[str]:
-        url = url_template.format(domain=parent)
         new_labels: Set[str] = set()
         try:
             if fmt == "dnsdumpster":
@@ -955,12 +955,19 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                         new_labels.add(candidate)
                 return new_labels
 
-            raw = await asyncio.to_thread(_scrape_source, url)
-            if not raw:
-                return new_labels
-
-            if name == "rapiddns":
-                domains = _extract_domains_from_text(raw, parent)
+            if name == "archive":
+                now = datetime.datetime.utcnow()
+                two_years_ago = now - datetime.timedelta(days=730)
+                from_param = two_years_ago.strftime("%Y%m%d")
+                to_param = now.strftime("%Y%m%d")
+                archive_url = (
+                    f"http://web.archive.org/cdx/search/cdx?url=*.{parent}"
+                    f"&from={from_param}&to={to_param}&collapse=urlkey&filter=statuscode:200&limit=5000"
+                )
+                raw = await asyncio.to_thread(_scrape_source, archive_url)
+                if not raw:
+                    return new_labels
+                domains = _extract_domains_from_cdx(raw, parent)
                 for host in domains:
                     candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
@@ -968,8 +975,14 @@ async def scrape_fetch_labels(parent: str, progress_hook: Optional[Callable[[int
                         new_labels.add(candidate)
                 return new_labels
 
-            if name == "archive":
-                domains = _extract_domains_from_cdx(raw, parent)
+            url = url_template.format(domain=parent)
+
+            raw = await asyncio.to_thread(_scrape_source, url)
+            if not raw:
+                return new_labels
+
+            if name == "rapiddns":
+                domains = _extract_domains_from_text(raw, parent)
                 for host in domains:
                     candidates = _labels_from_hostname(host, parent)
                     cleaned = [candidate for candidate in candidates if candidate]
@@ -1151,8 +1164,20 @@ async def main():
     archive_total = 0
     archive_new = 0
 
+    scrape_future = asyncio.create_task(
+        scrape_fetch_labels(PARENT, progress_hook=phase_increment)
+    )
+
+    openai_task: Optional[asyncio.Task] = None
+    if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
+        progress['phase_total'] += OPENAI_LABEL_ROUNDS
+        refresh_progress()
+        openai_task = asyncio.create_task(
+            openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment)
+        )
+
     scrape_labels, scrape_source_map = await run_with_spinner(
-        scrape_fetch_labels(PARENT, progress_hook=phase_increment),
+        scrape_future,
         "Querying scraping sources"
     )
     archive_labels = scrape_source_map.get("archive", set())
@@ -1169,12 +1194,10 @@ async def main():
     refresh_progress()
     archive_new = len([label for label in archive_labels if label not in pre_scrape_base])
 
-    if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
-        progress['phase_total'] += OPENAI_LABEL_ROUNDS
-        refresh_progress()
+    if openai_task is not None:
         try:
             openai_labels = await run_with_spinner(
-                openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment),
+                openai_task,
                 "Interacting with LLM"
             )
         except Exception as exc:
