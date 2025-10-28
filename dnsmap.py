@@ -500,13 +500,15 @@ def _phase_line(symbol: str, text: str, suffix: str = "", newline: bool = False)
 
 
 class Spinner:
-    def __init__(self, text: str, interval: float = 0.15, frames: str = SPINNER_FRAMES):
+    def __init__(self, text: str, interval: float = 0.15, frames: str = SPINNER_FRAMES,
+                 status_supplier: Optional[Callable[[], str]] = None):
         self.text = text
         self.interval = interval
         self.frames = frames
         self._idx = 0
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._status_supplier = status_supplier
 
     async def start(self):
         if self._task is not None:
@@ -520,14 +522,16 @@ class Spinner:
             while self._running and frame_count > 0:
                 symbol = self.frames[self._idx % frame_count]
                 self._idx += 1
-                _phase_line(symbol, self.text, " ...", newline=False)
+                suffix = self._status_supplier() if self._status_supplier else " ..."
+                _phase_line(symbol, self.text, suffix, newline=False)
                 await asyncio.sleep(self.interval)
         except asyncio.CancelledError:
             pass
 
-    async def stop(self, final_suffix: str = " (done)"):
+    async def stop(self, final_suffix: Optional[str] = None):
         if self._task is None:
-            _phase_line('>', self.text, final_suffix, newline=True)
+            suffix = final_suffix if final_suffix is not None else " (done)"
+            _phase_line('>', self.text, suffix, newline=True)
             return
         self._running = False
         self._task.cancel()
@@ -537,12 +541,14 @@ class Spinner:
             pass
         self._task = None
         self._idx = 0
-        _phase_line('>', self.text, final_suffix, newline=True)
+        suffix = final_suffix if final_suffix is not None else " (done)"
+        _phase_line('>', self.text, suffix, newline=True)
 
 
 async def run_with_spinner(coro: Awaitable[Any], text: str,
+                           *, status_supplier: Optional[Callable[[], str]] = None,
                            success_suffix: str = " (done)", failure_suffix: str = " (failed)"):
-    spinner = Spinner(text)
+    spinner = Spinner(text, status_supplier=status_supplier)
     await spinner.start()
     try:
         result = await coro
@@ -1216,7 +1222,12 @@ async def main():
 
     found_names: List[str] = []
 
-    brute_spinner = Spinner("Performing DNS bruteforcing using internal list")
+    def brute_suffix() -> str:
+        elapsed = max(1e-6, time.perf_counter() - start_time)
+        rate = progress.get("attempted", 0) / elapsed
+        return f" • {rate:.1f}/s"
+
+    brute_spinner = Spinner("Performing DNS bruteforcing using internal list", status_supplier=brute_suffix)
     await brute_spinner.start()
     try:
         for s in base_labels_list:
@@ -1242,7 +1253,8 @@ async def main():
         except asyncio.CancelledError:
             pass
     finally:
-        await brute_spinner.stop()
+        final_rate = progress.get("attempted", 0) / max(1e-6, time.perf_counter() - start_time)
+        await brute_spinner.stop(f" (done • {final_rate:.1f}/s)")
 
     for name in found_names:
         print(name)
