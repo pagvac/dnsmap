@@ -559,177 +559,6 @@ async def run_with_spinner(coro: Awaitable[Any], text: str,
         await spinner.stop(success_suffix)
         return result
 
-# --- OpenAI-assisted enumeration ------------------------------------
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-_LABEL_ALLOWED = set(string.ascii_lowercase + string.digits + "-")
-OPENAI_LABEL_ROUNDS = int(os.getenv("DNSMAP_OPENAI_ROUNDS", "3"))
-OPENAI_LABEL_TARGET_PER_ROUND = int(os.getenv("DNSMAP_OPENAI_TARGET_PER_ROUND", "100"))
-
-
-def _strip_order_prefix(text: str) -> str:
-    return re.sub(r"^[0-9]+[\.\)\-\s_]*", "", text)
-
-
-def _normalise_label(candidate: str, parent: str) -> Optional[str]:
-    label = _strip_order_prefix(candidate.strip().lower())
-    if not label:
-        return None
-    if label.endswith(f".{parent}"):
-        label = label[:-(len(parent) + 1)]
-    if "." in label:
-        return None
-    if label[0] == "-" or label[-1] == "-":
-        return None
-    if not set(label) <= _LABEL_ALLOWED:
-        return None
-    if len(label) > 63:
-        return None
-    return label
-
-
-async def _openai_chat(prompt: str, api_key: str, *, model: str = os.getenv("DNSMAP_OPENAI_MODEL", "gpt-4o-mini"), timeout: float = 90.0,
-                       retries: int = 2, max_tokens: int = 3000) -> Optional[str]:
-    body = json.dumps({
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an OSINT and cybersecurity analyst with access to open web resources."
-                    "Use cert transparency logs sites such as crt.sh, DNS analytics sites such as rapiddns.io & dnsdumpster.com, search engines, leaked configuration snippets, GitHub."
-                    "Use any any online resources you deem suitable sources of domain name intelligence."
-                    "Return just the bare subdomain labels (subdomains only, no dots), one per line, with no commentary."
-                    "Return as many subdomains (labels) as you can. Focus on subdomains that are likely to be active. I.e. subdomains that resolve to an IP address."
-                )
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.25,
-        "max_tokens": max_tokens,
-        "n": 1,
-    }).encode("utf-8")
-
-    def _send(local_timeout: float):
-        req = urllib.request.Request(
-            OPENAI_CHAT_URL,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=local_timeout) as resp:
-            return resp.read().decode("utf-8")
-
-    attempt = 0
-    while True:
-        try:
-            response = await asyncio.to_thread(_send, timeout)
-            break
-        except urllib.error.HTTPError as http_err:
-            try:
-                http_err.read()
-            except Exception:
-                pass
-            code = getattr(http_err, "code", "unknown")
-            _log_warning(f"OpenAI HTTP error {code}")
-            return None
-        except urllib.error.URLError as url_err:
-            attempt += 1
-            if attempt > retries:
-                _log_warning(f"OpenAI request failed: {url_err.reason}")
-                return None
-            await asyncio.sleep(2 * attempt)
-            continue
-        except Exception as exc:
-            _log_warning(f"OpenAI request failed: {exc}")
-            return None
-
-    try:
-        payload = json.loads(response)
-    except json.JSONDecodeError:
-        _log_warning("OpenAI response was not valid JSON")
-        return None
-
-    try:
-        return payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        _log_warning("OpenAI response missing expected fields")
-        return None
-
-
-def _extract_labels(content: str, parent: str) -> List[str]:
-    candidates = re.split(r"[\n,]+", content)
-    cleaned: List[str] = []
-    seen = set()
-    for cand in candidates:
-        label = _normalise_label(cand, parent)
-        if not label:
-            continue
-        if label in seen:
-            continue
-        seen.add(label)
-        cleaned.append(label)
-    return cleaned
-
-
-async def openai_fetch_labels(parent: str, base_labels: Set[str], progress_hook: Optional[Callable[[int], None]] = None) -> List[str]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return []
-
-    dot_parent = parent.lstrip('.')
-    rounds = max(1, OPENAI_LABEL_ROUNDS)
-    min_expected = max(1, OPENAI_LABEL_TARGET_PER_ROUND)
-
-    lines = [
-        f"Identify subdomains under .{dot_parent}.",
-        f"Return at least {min_expected} subdomain labels (single label, no dots).",
-        "Return lowercase labels separated by commas. No commentary, numbering, or duplicates.",
-    ]
-    prompt = "\n".join(lines)
-
-    aggregate: List[str] = []
-    seen: Set[str] = {label.lower() for label in base_labels}
-
-    tasks = [
-        asyncio.create_task(_openai_chat(prompt, api_key, timeout=120.0, retries=3, max_tokens=4000))
-        for _ in range(rounds)
-    ]
-
-    responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-    total_labels = 0
-    total_new = 0
-
-    for content in responses:
-        if isinstance(content, Exception) or not content:
-            if progress_hook:
-                progress_hook(1)
-            continue
-
-        suggestions = _extract_labels(content, parent)
-        if not suggestions:
-            if progress_hook:
-                progress_hook(1)
-            continue
-
-        fresh = []
-        for label in suggestions:
-            lowered = label.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            aggregate.append(label)
-            fresh.append(label)
-
-        total_labels += len(suggestions)
-        total_new += len(fresh)
-        if progress_hook:
-            progress_hook(1)
-
-    return aggregate
 # --------------------------------------------------------------------
 
 
@@ -1162,7 +991,6 @@ async def main():
 
     refresh_progress()
 
-    openai_labels: List[str] = []
     openai_label_set: Set[str] = set()
     scrape_label_set: Set[str] = set()
 
@@ -1172,8 +1000,6 @@ async def main():
     scrape_future = asyncio.create_task(
         scrape_fetch_labels(PARENT, progress_hook=phase_increment)
     )
-    if os.getenv("OPENAI_API_KEY"):
-        _log_warning("OpenAI label generation disabled; ignoring OPENAI_API_KEY")
 
     scrape_labels, scrape_source_map = await run_with_spinner(
         scrape_future,
@@ -1193,16 +1019,7 @@ async def main():
     refresh_progress()
     archive_new = len([label for label in archive_labels if label not in pre_scrape_base])
 
-    if openai_labels:
-        for label in openai_labels:
-            norm = str(label).strip().lower()
-            if not norm or norm in base_labels_set:
-                continue
-            base_labels_set.add(norm)
-            base_labels_list.append(norm)
-        openai_label_set = {str(label).strip().lower() for label in openai_labels if str(label).strip()}
-        progress['total_labels'] = len(base_labels_list)
-        refresh_progress()
+    # OpenAI enumeration is disabled; openai_label_set remains empty
 
     found_names: List[str] = []
 
