@@ -1172,14 +1172,8 @@ async def main():
     scrape_future = asyncio.create_task(
         scrape_fetch_labels(PARENT, progress_hook=phase_increment)
     )
-
-    openai_task: Optional[asyncio.Task] = None
-    if os.getenv("OPENAI_API_KEY") and not wildcard_detected:
-        progress['phase_total'] += OPENAI_LABEL_ROUNDS
-        refresh_progress()
-        openai_task = asyncio.create_task(
-            openai_fetch_labels(PARENT, base_labels_set.copy(), progress_hook=phase_increment)
-        )
+    if os.getenv("OPENAI_API_KEY"):
+        _log_warning("OpenAI label generation disabled; ignoring OPENAI_API_KEY")
 
     scrape_labels, scrape_source_map = await run_with_spinner(
         scrape_future,
@@ -1199,15 +1193,7 @@ async def main():
     refresh_progress()
     archive_new = len([label for label in archive_labels if label not in pre_scrape_base])
 
-    if openai_task is not None:
-        try:
-            openai_labels = await run_with_spinner(
-                openai_task,
-                "Interacting with LLM"
-            )
-        except Exception as exc:
-            _log_warning(f"OpenAI label fetch failed: {exc}")
-            openai_labels = []
+    if openai_labels:
         for label in openai_labels:
             norm = str(label).strip().lower()
             if not norm or norm in base_labels_set:
@@ -1217,8 +1203,6 @@ async def main():
         openai_label_set = {str(label).strip().lower() for label in openai_labels if str(label).strip()}
         progress['total_labels'] = len(base_labels_list)
         refresh_progress()
-    elif os.getenv("OPENAI_API_KEY") and wildcard_detected:
-        _log_warning("OpenAI label generation skipped due to wildcard DNS detection")
 
     found_names: List[str] = []
 
