@@ -331,7 +331,6 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                  resolvers: List[aresolver.Resolver], timeout_ref: dict,
                  wildcard_ips: Set[str], progress: dict,
                  results: List[str],
-                 openai_labels: Optional[Set[str]] = None,
                  scrape_labels: Optional[Set[str]] = None):
     while True:
         label = await q.get()
@@ -348,8 +347,6 @@ async def worker(q: asyncio.Queue, parent: str, limiter,
                 limiter.release()
             if addrs and (not wildcard_ips or not all(a in wildcard_ips for a in addrs)):
                 progress['found'] += 1
-                if openai_labels and label in openai_labels:
-                    progress['ai_found'] += 1
                 if scrape_labels and label in scrape_labels:
                     progress['scrape_found'] += 1
                 results.append(name)
@@ -975,7 +972,6 @@ async def main():
         'processed': 0,
         'attempted': 0,
         'found': 0,
-        'ai_found': 0,
         'scrape_found': 0,
         'phase_completed': 0,
         'phase_total': 1,
@@ -991,7 +987,6 @@ async def main():
 
     refresh_progress()
 
-    openai_label_set: Set[str] = set()
     scrape_label_set: Set[str] = set()
 
     archive_total = 0
@@ -1019,7 +1014,6 @@ async def main():
     refresh_progress()
     archive_new = len([label for label in archive_labels if label not in pre_scrape_base])
 
-    # OpenAI enumeration is disabled; openai_label_set remains empty
 
     found_names: List[str] = []
 
@@ -1036,7 +1030,7 @@ async def main():
         workers = [
             asyncio.create_task(worker(
                 q, PARENT, limiter, resolvers, timeout_ref, wildcard_ips,
-                progress, found_names, openai_label_set, scrape_label_set
+                progress, found_names, scrape_label_set
             ))
             for _ in range(INITIAL_CONCURRENCY)
         ]
@@ -1065,12 +1059,11 @@ async def main():
     duration = max(1e-6, end_time - start_time)
     attempted = progress.get("attempted", 0)
     found = progress.get("found", 0)
-    ai_found = progress.get("ai_found", 0)
     scrape_found = progress.get("scrape_found", 0)
     avg_per_sec = attempted / duration if duration > 0 else float(attempted)
     stats_line = (
         f"[stats] duration={duration:.2f}s attempted={attempted} found={found} "
-        f"openai_found={ai_found} scrape_found={scrape_found} avg_per_sec={avg_per_sec:.2f}"
+        f"scrape_found={scrape_found} avg_per_sec={avg_per_sec:.2f}"
     )
     if CLI_DEBUG:
         stats_line += f" archive_total={archive_total} archive_new={archive_new}"
