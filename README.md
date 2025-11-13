@@ -1,4 +1,4 @@
-# dnsmap, a simple subdomain bruteforcer
+# dnsmap, a simple subdomain scraper & bruteforcer
 
 This is the project page of the new version of dnsmap which has been ported from C to python by its original author. The [old version](https://github.com/resurrecting-open-source-projects/dnsmap) should no longer be used.
 
@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 On Windows PowerShell, replace the `source` line with `.venv\Scripts\Activate.ps1`. Once the dependencies are installed, the `dnsmap.py` script can be run from the activated virtual environment.
 
-Run it against any domain:
+## Run it against any domain
 
 ```
 $ python3 dnsmap.py github.com
