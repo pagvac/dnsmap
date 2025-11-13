@@ -27,6 +27,12 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: pip install -r requirements.txt
     - name: Run dnsmap against github.com
       if: "${{ github.event.inputs.domain == '' }}"
       run: python dnsmap.py github.com
