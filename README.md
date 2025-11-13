@@ -2,9 +2,19 @@
 
 This is the project page of the new version of dnsmap which has been ported from C to python by its original author. The [old version](https://github.com/resurrecting-open-source-projects/dnsmap) should no longer be used.
 
-See an example command below. Yup, it's that simple! 😜
-
 dnsmap intentionally ships without command-line flags. The goal is to keep the tool approachable for OSINT newcomers who just need a single command that works out of the box—no option hunting, no prerequisite tuning.
+
+## Install the Python dependencies
+
+Create a virtual environment (recommended) and install everything listed in `requirements.txt`:
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+On Windows PowerShell, replace the `source` line with `.venv\Scripts\Activate.ps1`. Once the dependencies are installed, the `dnsmap.py` script can be run from the activated virtual environment.
 
 Run it against any domain:
 
@@ -60,7 +70,7 @@ cli.github.com
 [stats] duration=198.43s attempted=100735 found=44 scrape_found=10 avg_per_sec=507.67
 ```
 
-The progress bar, tuning messages, and scrape telemetry all stay on stderr. Only the confirmed subdomains land on stdout, so redirecting the output gives a clean list ready for whatever tooling you use next:
+The progress bar and telemetry all stay on stderr. Only the confirmed subdomains land on stdout, so redirecting the output gives a clean list ready for whatever tooling you use next:
 
 ```
 $ python3 dnsmap.py example.com > subs.txt
